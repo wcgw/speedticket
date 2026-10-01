@@ -1,0 +1,28 @@
+[package]
+name = "speedticket"
+version = "0.1.0"
+edition = "2024"
+description = "A sharded, finite-budget semaphore: per-thread shards with lock-free, bounded stealing"
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["semaphore", "concurrency", "sharded", "permits", "lock-free"]
+categories = ["concurrency"]
+
+[dependencies]
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "fill_drain"
+harness = false
+
+[[bench]]
+name = "steal"
+harness = false
+
+[target."cfg(loom)".dependencies]
+loom = "0.7.2"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
