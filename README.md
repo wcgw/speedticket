@@ -111,17 +111,22 @@ The benches compare `speedticket`'s `Limit` (one participant per thread) and
 `Pool` (shared by every thread) against `tokio::sync::Semaphore` and a baseline
 semaphore built on a single shared `AtomicU64`, with a budget of 1000 permits.
 
-These numbers come from single criterion runs on one laptop (Intel Core Ultra 7
-255U), with every thread pinned to its 8 identical efficiency cores:
+These numbers come from a single criterion run on one desktop (AMD Ryzen 9 7900,
+12 cores / 24 threads in two 6-core CCDs, each with its own L3). Boost was off,
+with the `performance` governor and EPP, so clocks were capped at the 3.7 GHz
+base. Runs with up to 6 threads were pinned to the six physical cores of one
+CCD. The 8-thread runs were pinned to four physical cores on each CCD, so they
+also pay for traffic between the CCDs. SMT siblings were left unused in both
+cases:
 
 ```sh
-cargo bench --no-run && taskset -c 4-11 cargo bench
+cargo bench --no-run
+taskset -c 6-11 cargo bench -- '/[1246]_threads/'
+taskset -c 2-9 cargo bench -- '/8_threads/'
 ```
 
-Pin the threads when benchmarking on a hybrid CPU. Left unpinned, threads land
-on performance, efficiency and low-power cores at random, and runs disagree by
-25% or more; pinned, repeated runs on this machine agree within about ±5%.
-Treat the numbers as indicative only.
+Across three runs, 41 of the 60 results varied by under 10%, but some varied by
+up to 17% (`speedticket`) and 37% (tokio). Treat them as indicative only.
 
 ### `claim_release`: the common case
 
@@ -133,17 +138,17 @@ holding one across an `.await` would (`Pool::try_claim_owned`,
 
 | threads | `Limit` | `Pool`  | `Pool` owned | tokio   | tokio owned | single atomic |
 |--------:|--------:|--------:|-------------:|--------:|------------:|--------------:|
-| 1       | 22.4 ns | 24.5 ns | 44.7 ns      | 47.2 ns | 65.4 ns     | 16.4 ns       |
-| 2       | 35.5 ns | 37.8 ns | 68.3 ns      | 999 ns  | 1.35 µs     | 348 ns        |
-| 4       | 31.5 ns | 36.6 ns | 62.4 ns      | 1.66 µs | 1.93 µs     | 1.03 µs       |
-| 8       | 20.0 ns | 24.0 ns | 37.8 ns      | 3.50 µs | 4.29 µs     | 12.8 µs       |
+| 1       | 4.54 ns | 4.60 ns | 8.73 ns      | 8.82 ns | 13.2 ns     | 4.53 ns       |
+| 2       | 4.53 ns | 4.60 ns | 8.72 ns      | 122 ns  | 149 ns      | 37.8 ns       |
+| 4       | 4.56 ns | 4.60 ns | 8.85 ns      | 335 ns  | 400 ns      | 77.9 ns       |
+| 8       | 4.98 ns | 5.18 ns | 10.0 ns      | 778 ns  | 965 ns      | 317 ns        |
 
 Both `speedticket` variants stay flat as threads are added, because each thread
 claims and releases against its own shard. Every other variant contends on one
 shared counter, and `tokio::sync::Semaphore` also takes a lock on every
 release, so they slow down as soon as a second thread joins: at 8 threads,
-`Pool` is about 145× faster than tokio, and its owned permits about 115× faster
-than tokio's.
+spread over both CCDs, `Pool` is about 150× faster than tokio, and its owned
+permits about 95× faster than tokio's.
 
 ### `fill_drain`: race to exhaustion, then release everything
 
@@ -152,10 +157,11 @@ The threads then wait at a barrier, release everything, and wait at a barrier
 again. Times are per round and include the barrier cost, which every variant
 pays.
 
-| threads | `Limit` | `Pool`  | tokio  | single atomic |
-|--------:|--------:|--------:|-------:|--------------:|
-| 4       | 29.3 µs | 29.5 µs | 433 µs | 339 µs        |
-| 6       | 35.8 µs | 36.4 µs | 925 µs | 920 µs        |
+| threads | `Limit` | `Pool`  | tokio   | single atomic |
+|--------:|--------:|--------:|--------:|--------------:|
+| 4       | 8.83 µs | 9.01 µs | 26.2 µs | 14.5 µs       |
+| 6       | 14.3 µs | 13.9 µs | 41.6 µs | 21.2 µs       |
+| 8       | 30.4 µs | 29.5 µs | 100 µs  | 49.5 µs       |
 
 ### `steal`: pinned at exhaustion
 
@@ -165,18 +171,20 @@ no barriers between threads. This forces claims onto the steal path, where
 
 | threads | churn | `Limit` | `Pool`  | tokio   | single atomic |
 |--------:|------:|--------:|--------:|--------:|--------------:|
-| 4       | 1     | 446 ns  | 521 ns  | 1.42 µs | 568 ns        |
-| 4       | 4     | 1.94 µs | 1.88 µs | 5.09 µs | 3.98 µs       |
-| 6       | 1     | 726 ns  | 810 ns  | 2.76 µs | 1.62 µs       |
-| 6       | 4     | 2.90 µs | 2.84 µs | 10.2 µs | 9.24 µs       |
+| 4       | 1     | 339 ns  | 341 ns  | 393 ns  | 70.0 ns       |
+| 4       | 4     | 1.11 µs | 944 ns  | 1.41 µs | 391 ns        |
+| 6       | 1     | 715 ns  | 630 ns  | 523 ns  | 102 ns        |
+| 6       | 4     | 2.18 µs | 1.93 µs | 1.73 µs | 573 ns        |
+| 8       | 1     | 1.56 µs | 1.47 µs | 1.00 µs | 229 ns        |
+| 8       | 4     | 4.96 µs | 4.46 µs | 3.62 µs | 1.16 µs       |
 
 With a churn of 1, most claims end with a search of every peer that finds
 nothing, and every search reads cache lines that other cores keep changing.
-This is `speedticket`'s worst case. It still beats the single shared counter,
-which every thread now fights over, but `Pool` trails `Limit` here by 12–17%:
-its faster claim path fails faster, and failing faster means more of those
-contended reads per round. Once peers have permits to give (churn 4), both
-variants are 2–3.6× faster than tokio and the single atomic.
+This is `speedticket`'s worst case: the single atomic needs just one read to
+say no, and is about 5–7× faster. Once peers have permits to give (churn 4),
+the gap narrows to about 2.4–4.3×, but the single atomic still wins at every
+thread count. tokio trails both `speedticket` variants at 4 threads but beats
+them at 6 and 8, by up to about 1.6×.
 
 ## License
 

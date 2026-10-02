@@ -13,7 +13,7 @@ use speedticket::{Limit, Pool};
 use tokio::sync::Semaphore;
 
 pub const TOTAL: u64 = 1000;
-pub const THREAD_COUNTS: [usize; 2] = [4, 6];
+pub const THREAD_COUNTS: [usize; 3] = [4, 6, 8];
 
 /// One thread's view of a pool: claim permits, release them on drop.
 pub trait Participant: Send {
