@@ -1,7 +1,8 @@
 //! N threads race to claim the whole budget, then all release it again.
 //!
-//! Compares `speedticket::Limit` against a baseline semaphore built on a single
-//! shared `AtomicU64`. Both variants pay the same per-round barrier cost.
+//! Compares `speedticket::Limit` and `speedticket::Pool` against
+//! `tokio::sync::Semaphore` and a baseline semaphore built on a single shared
+//! `AtomicU64`. Every variant pays the same per-round barrier cost.
 
 mod common;
 
@@ -9,7 +10,9 @@ use std::hint::black_box;
 use std::sync::Barrier;
 use std::time::Duration;
 
-use common::{Participant, THREAD_COUNTS, TOTAL, race, sharded, single_atomic};
+use common::{
+    Participant, THREAD_COUNTS, TOTAL, pool, race, sharded, single_atomic, tokio_semaphore,
+};
 use criterion::{Criterion, criterion_group, criterion_main};
 
 /// Runs `rounds` fill-then-drain rounds, one thread per participant.
@@ -40,6 +43,12 @@ fn bench(c: &mut Criterion) {
         let mut group = c.benchmark_group(format!("fill_drain/{threads}_threads/{TOTAL}_permits"));
         group.bench_function("speedticket", |b| {
             b.iter_custom(|rounds| fill_drain(sharded(threads), rounds));
+        });
+        group.bench_function("pool", |b| {
+            b.iter_custom(|rounds| fill_drain(pool(threads), rounds));
+        });
+        group.bench_function("tokio", |b| {
+            b.iter_custom(|rounds| fill_drain(tokio_semaphore(threads), rounds));
         });
         group.bench_function("single_atomic", |b| {
             b.iter_custom(|rounds| fill_drain(single_atomic(threads), rounds));

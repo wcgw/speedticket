@@ -42,18 +42,27 @@
 //! let shared = std::sync::Arc::clone(&limit);
 //! std::thread::spawn(move || shared.try_claim().is_some());
 //! ```
+//!
+//! On a multi-threaded async runtime, whose tasks migrate between threads
+//! while holding a permit, use a [`Pool`] instead. With the `async` feature,
+//! `Pool::claim` waits for a permit rather than failing.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod pool;
 mod shard;
 mod sync;
+#[cfg(feature = "async")]
+mod wait;
+
+pub use pool::{OwnedPermit, Pool, PoolPermit};
 
 use std::cell::Cell;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::sync::PoisonError;
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::Ordering::{Relaxed, SeqCst};
 use std::{error, fmt, thread};
 
 use shard::Shard;
@@ -89,9 +98,31 @@ struct Shared {
     /// One past the highest slot ever occupied; bounds the steal scan. Only
     /// grows, and is only written under the `registry` lock.
     high_water: AtomicUsize,
+    /// Free slots. Only written under the `registry` lock; read without it
+    /// by threads of a [`Pool`] that found it at capacity, to know when
+    /// joining is worth a try again.
+    vacancies: AtomicUsize,
     /// The join-lock: guards slot occupancy on the cold registration and
     /// deregistration paths. Claims and releases never take it.
     registry: Mutex<Registry>,
+    first_slot: FirstSlot,
+    /// Claims waiting for permits; every deposit notifies it.
+    #[cfg(feature = "async")]
+    waiters: wait::WaitQueue,
+}
+
+/// The slot that holds the whole budget at creation.
+const FIRST_SLOT: usize = 0;
+
+/// What the [`FIRST_SLOT`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstSlot {
+    /// The first [`Limit`]: a participant like any other.
+    Participant,
+    /// A [`Pool`]'s home shard, used by threads without a participant of
+    /// their own. It takes no share: newcomers drain it first, and leavers
+    /// refill it only when no participant remains.
+    Home,
 }
 
 /// Which slots are occupied by a live participant.
@@ -156,19 +187,8 @@ impl Limit {
     /// assert!(limit.participant().is_err());
     /// ```
     pub fn with_capacity(total: u64, max_participants: NonZeroUsize) -> Self {
-        let max_participants = max_participants.get();
-        let shards = (0..max_participants)
-            .map(|slot| Shard::new(if slot == 0 { total } else { 0 }))
-            .collect();
-        let mut occupied = vec![false; max_participants].into_boxed_slice();
-        occupied[0] = true;
-        let shared = Shared {
-            total,
-            shards,
-            high_water: AtomicUsize::new(1),
-            registry: Mutex::new(Registry { occupied }),
-        };
-        Self::from_parts(Arc::new(shared), 0)
+        let shared = Shared::new(total, max_participants.get(), FirstSlot::Participant);
+        Self::from_parts(shared, FIRST_SLOT)
     }
 
     fn from_parts(shared: Arc<Shared>, slot: usize) -> Self {
@@ -200,26 +220,8 @@ impl Limit {
     /// # Ok::<(), speedticket::AtCapacity>(())
     /// ```
     pub fn participant(&self) -> Result<Limit, AtCapacity> {
-        let shared = &self.shared;
-        let mut registry = shared.registry();
-        let slot = registry.free_slot().ok_or(AtCapacity)?;
-        let participants = registry.live_slots().count() + 1;
-        let target = shared.total / participants as u64;
-
-        let mut need = target;
-        for peer in registry.live_slots() {
-            if need == 0 {
-                break;
-            }
-            let taken = shared.shards[peer].take(|idle| idle.saturating_sub(target).min(need));
-            need -= taken;
-        }
-        shared.shards[slot].give(target - need);
-
-        registry.occupied[slot] = true;
-        shared.high_water.fetch_max(slot + 1, Relaxed);
-        drop(registry);
-        Ok(Self::from_parts(Arc::clone(shared), slot))
+        let slot = self.shared.join()?;
+        Ok(Self::from_parts(Arc::clone(&self.shared), slot))
     }
 
     /// Claims one permit without blocking.
@@ -241,38 +243,10 @@ impl Limit {
     /// assert!(second.try_claim().is_none());
     /// # Ok::<(), speedticket::AtCapacity>(())
     /// ```
+    #[inline]
     pub fn try_claim(&self) -> Option<Permit<'_>> {
         // Build the `Permit` only on success: dropping one releases a permit.
-        if self.shard().take(|_| 1) == 1 || self.steal() {
-            Some(Permit { limit: self })
-        } else {
-            None
-        }
-    }
-
-    /// Steals a batch from the first peer with idle permits, keeping one as
-    /// the claimed permit and banking the rest locally. Visits each peer at
-    /// most once, starting just after this participant's slot.
-    fn steal(&self) -> bool {
-        let scanned = &self.shared.shards[..self.shared.high_water.load(Relaxed)];
-        // Peers after this slot, then wrapping round to those before it.
-        let peers = scanned
-            .iter()
-            .skip(self.slot + 1)
-            .chain(&scanned[..self.slot]);
-        if peers.clone().fold(0, |any, peer| any | peer.idle()) == 0 {
-            return false;
-        }
-        let stolen = peers
-            .map(|peer| peer.take(|idle| (idle / 2).max(1)))
-            .find(|&stolen| stolen > 0);
-        match stolen {
-            Some(stolen) => {
-                self.shard().give(stolen - 1);
-                true
-            }
-            None => false,
-        }
+        self.shared.claim(self.slot).then(|| Permit { limit: self })
     }
 
     fn shard(&self) -> &Shard {
@@ -294,25 +268,138 @@ impl Drop for Limit {
     /// Deregisters this participant and spreads its idle permits evenly over
     /// the remaining peers.
     fn drop(&mut self) {
-        let shared = &self.shared;
-        let mut registry = shared.registry();
-        registry.occupied[self.slot] = false;
-        // Under the join-lock nobody can occupy this slot yet, and nothing but
-        // the (now gone) owner deposits into it, so it stays empty for reuse.
-        let idle = shared.shards[self.slot].drain();
-        let peers = registry.live_slots().count() as u64;
-        if peers == 0 {
-            // Last participant: the pool, and its permits, are gone.
-            return;
-        }
-        let (share, remainder) = (idle / peers, idle % peers);
-        for (i, peer) in (0u64..).zip(registry.live_slots()) {
-            shared.shards[peer].give(share + u64::from(i < remainder));
-        }
+        self.shared.leave(self.slot);
     }
 }
 
 impl Shared {
+    /// A pool of `capacity` slots whose [`FIRST_SLOT`] is occupied and holds
+    /// all `total` permits.
+    fn new(total: u64, capacity: usize, first_slot: FirstSlot) -> Arc<Self> {
+        let shards = (0..capacity)
+            .map(|slot| Shard::new(if slot == FIRST_SLOT { total } else { 0 }))
+            .collect();
+        let mut occupied = vec![false; capacity].into_boxed_slice();
+        occupied[FIRST_SLOT] = true;
+        Arc::new(Self {
+            total,
+            shards,
+            high_water: AtomicUsize::new(FIRST_SLOT + 1),
+            vacancies: AtomicUsize::new(capacity - 1),
+            registry: Mutex::new(Registry { occupied }),
+            first_slot,
+            #[cfg(feature = "async")]
+            waiters: wait::WaitQueue::new(),
+        })
+    }
+
+    /// The occupied slots that take a share of the budget: every live one,
+    /// bar a home shard.
+    fn participants<'r>(&self, registry: &'r Registry) -> impl Iterator<Item = usize> + 'r {
+        let home = (self.first_slot == FirstSlot::Home).then_some(FIRST_SLOT);
+        registry
+            .live_slots()
+            .filter(move |&slot| Some(slot) != home)
+    }
+
+    /// Whether a slot was free when last looked at, without taking the lock.
+    fn has_vacancy(&self) -> bool {
+        self.vacancies.load(Relaxed) > 0
+    }
+
+    /// Occupies a free slot and carves it an even share of the budget, out
+    /// of peers' idle surplus. See [`Limit::participant`].
+    fn join(&self) -> Result<usize, AtCapacity> {
+        let mut registry = self.registry();
+        let slot = registry.free_slot().ok_or(AtCapacity)?;
+        let participants = self.participants(&registry).count() + 1;
+        let target = self.total / participants as u64;
+
+        let mut need = target;
+        if self.first_slot == FirstSlot::Home {
+            // A home shard keeps no share: drain it before touching peers.
+            need -= self.shards[FIRST_SLOT].take(|_| need);
+        }
+        for peer in self.participants(&registry) {
+            if need == 0 {
+                break;
+            }
+            let taken = self.shards[peer].take(|idle| idle.saturating_sub(target).min(need));
+            need -= taken;
+        }
+        // Raised before the deposit, and `SeqCst` like it, so a waiter that
+        // sees the deposit also scans this slot (see `wait.rs`).
+        self.high_water.fetch_max(slot + 1, SeqCst);
+        self.give(slot, target - need);
+
+        registry.occupied[slot] = true;
+        self.vacancies.fetch_sub(1, Relaxed);
+        Ok(slot)
+    }
+
+    /// Vacates `slot` and spreads its idle permits evenly over the remaining
+    /// participants, or hands them to a home shard if none remain.
+    fn leave(&self, slot: usize) {
+        let mut registry = self.registry();
+        registry.occupied[slot] = false;
+        self.vacancies.fetch_add(1, Relaxed);
+        // Under the join-lock nobody can occupy this slot yet, and nothing but
+        // the (now gone) owner deposits into it, so it stays empty for reuse.
+        let idle = self.shards[slot].drain();
+        let peers = self.participants(&registry).count() as u64;
+        if peers == 0 {
+            if self.first_slot == FirstSlot::Home {
+                self.give(FIRST_SLOT, idle);
+            }
+            // Otherwise this was the last participant: the pool, and its
+            // permits, are gone.
+            return;
+        }
+        let (share, remainder) = (idle / peers, idle % peers);
+        for (i, peer) in (0u64..).zip(self.participants(&registry)) {
+            self.give(peer, share + u64::from(i < remainder));
+        }
+    }
+
+    /// Deposits `n` permits into `slot`'s shard, waking any claims waiting
+    /// for them. Every deposit goes through here.
+    #[inline]
+    fn give(&self, slot: usize, n: u64) {
+        self.shards[slot].give(n);
+        #[cfg(feature = "async")]
+        self.waiters.notify(n);
+    }
+
+    /// Claims one permit for `slot`: from its own shard, else by stealing.
+    #[inline]
+    fn claim(&self, slot: usize) -> bool {
+        self.shards[slot].take(|_| 1) == 1 || self.steal(slot)
+    }
+
+    /// Steals a batch from the first peer with idle permits, keeping one as
+    /// the claimed permit and banking the rest in `slot`. Visits each peer at
+    /// most once, starting just after `slot`.
+    #[cold]
+    #[inline(never)]
+    fn steal(&self, slot: usize) -> bool {
+        let scanned = &self.shards[..self.high_water.load(Relaxed)];
+        // Peers after this slot, then wrapping round to those before it.
+        let peers = scanned.iter().skip(slot + 1).chain(&scanned[..slot]);
+        if peers.clone().fold(0, |any, peer| any | peer.idle()) == 0 {
+            return false;
+        }
+        let stolen = peers
+            .map(|peer| peer.take(|idle| (idle / 2).max(1)))
+            .find(|&stolen| stolen > 0);
+        match stolen {
+            Some(stolen) => {
+                self.give(slot, stolen - 1);
+                true
+            }
+            None => false,
+        }
+    }
+
     fn registry(&self) -> MutexGuard<'_, Registry> {
         // The critical sections only flip flags and move counts between
         // atomics; a panic in one cannot leave the registry inconsistent.
@@ -331,8 +418,9 @@ impl Registry {
 }
 
 impl Drop for Permit<'_> {
+    #[inline]
     fn drop(&mut self) {
-        self.limit.shard().give(1);
+        self.limit.shared.give(self.limit.slot, 1);
     }
 }
 

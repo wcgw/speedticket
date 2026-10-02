@@ -1,14 +1,19 @@
 //! Harness shared by the benches: the pools under test and a timed race.
+#![allow(
+    dead_code,
+    reason = "each bench compiles this module and uses a subset of it"
+)]
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use speedticket::Limit;
+use speedticket::{Limit, Pool};
+use tokio::sync::Semaphore;
 
 pub const TOTAL: u64 = 1000;
-pub const THREAD_COUNTS: [usize; 2] = [4, 6];
+pub const THREAD_COUNTS: [usize; 3] = [4, 6, 8];
 
 /// One thread's view of a pool: claim permits, release them on drop.
 pub trait Participant: Send {
@@ -24,6 +29,49 @@ impl Participant for Limit {
 
     fn try_claim(&self) -> Option<Self::Permit<'_>> {
         Limit::try_claim(self)
+    }
+}
+
+/// A shared `speedticket::Pool`: each thread is bound to a shard on its
+/// first claim, and permits are released into the dropping thread's shard.
+impl Participant for Arc<Pool> {
+    type Permit<'a> = speedticket::PoolPermit<'a>;
+
+    fn try_claim(&self) -> Option<Self::Permit<'_>> {
+        Pool::try_claim(self)
+    }
+}
+
+/// As `Arc<Pool>`, but claiming `'static` permits that each hold the pool.
+pub struct OwnedPool(Arc<Pool>);
+
+impl Participant for OwnedPool {
+    type Permit<'a> = speedticket::OwnedPermit;
+
+    fn try_claim(&self) -> Option<Self::Permit<'_>> {
+        self.0.try_claim_owned()
+    }
+}
+
+/// `tokio::sync::Semaphore`: one shared counter for claims, and a lock on
+/// its wait list for every release.
+impl Participant for Arc<Semaphore> {
+    type Permit<'a> = tokio::sync::SemaphorePermit<'a>;
+
+    fn try_claim(&self) -> Option<Self::Permit<'_>> {
+        Semaphore::try_acquire(self).ok()
+    }
+}
+
+/// As `Arc<Semaphore>`, but claiming `'static` permits that each hold the
+/// semaphore.
+pub struct OwnedSemaphore(Arc<Semaphore>);
+
+impl Participant for OwnedSemaphore {
+    type Permit<'a> = tokio::sync::OwnedSemaphorePermit;
+
+    fn try_claim(&self) -> Option<Self::Permit<'_>> {
+        Arc::clone(&self.0).try_acquire_owned().ok()
     }
 }
 
@@ -61,6 +109,34 @@ pub fn sharded(threads: usize) -> Vec<Limit> {
         .collect();
     participants.push(first);
     participants
+}
+
+/// One handle per thread on a shared `speedticket::Pool` of `TOTAL`, which
+/// binds each thread to a shard on its first claim.
+pub fn pool(threads: usize) -> Vec<Arc<Pool>> {
+    let pool = Arc::new(Pool::new(TOTAL));
+    // Clone needed: each thread owns a handle on the one shared pool.
+    vec![pool; threads]
+}
+
+/// As [`pool`], claiming owned permits.
+pub fn owned_pool(threads: usize) -> Vec<OwnedPool> {
+    pool(threads).into_iter().map(OwnedPool).collect()
+}
+
+/// One handle per thread on a `tokio::sync::Semaphore` of `TOTAL`.
+pub fn tokio_semaphore(threads: usize) -> Vec<Arc<Semaphore>> {
+    let semaphore = Arc::new(Semaphore::new(TOTAL as usize));
+    // Clone needed: each thread owns a handle on the one shared semaphore.
+    vec![semaphore; threads]
+}
+
+/// As [`tokio_semaphore`], claiming owned permits.
+pub fn owned_tokio_semaphore(threads: usize) -> Vec<OwnedSemaphore> {
+    tokio_semaphore(threads)
+        .into_iter()
+        .map(OwnedSemaphore)
+        .collect()
 }
 
 /// One handle per thread on a single shared counter of `TOTAL`.

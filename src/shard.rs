@@ -1,11 +1,20 @@
 //! A single participant's counter of idle permits.
 
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::Ordering::{self, Relaxed};
 
 use crate::sync::AtomicU64;
 
 // `Relaxed` throughout: the counters gate admission but guard no cross-thread
-// data (a `Permit` is `!Send`, so there is no handoff to synchronize).
+// data (a `Permit` is `!Send`, so there is no handoff to synchronize). The
+// exception is `give` with the `async` feature; see `GIVE`.
+
+/// How [`Shard::give`] deposits permits. With the `async` feature a waiter's
+/// fence must order every deposit, which takes a `SeqCst` read-modify-write
+/// (see `wait.rs`); on x86 the locked add costs the same either way.
+#[cfg(feature = "async")]
+const GIVE: Ordering = Ordering::SeqCst;
+#[cfg(not(feature = "async"))]
+const GIVE: Ordering = Relaxed;
 
 /// Idle-permit counter padded to its own cache line, so participants on
 /// different cores never false-share.
@@ -53,7 +62,7 @@ impl Shard {
     /// Returns `n` permits to this shard.
     pub(crate) fn give(&self, n: u64) {
         if n > 0 {
-            self.idle.fetch_add(n, Relaxed);
+            self.idle.fetch_add(n, GIVE);
         }
     }
 

@@ -9,10 +9,19 @@ repository = "https://github.com/wcgw/speedticket"
 keywords = ["semaphore", "concurrency", "sharded", "permits", "lock-free"]
 categories = ["concurrency"]
 
+[features]
+## Async waiting: `Pool::claim` and `Pool::claim_owned`.
+async = []
+
 [dependencies]
 
 [dev-dependencies]
 criterion = "0.8.2"
+tokio = { version = "1.53.1", default-features = false, features = ["rt-multi-thread", "sync", "time"] }
+
+[[example]]
+name = "tokio"
+required-features = ["async"]
 
 [[bench]]
 name = "fill_drain"
@@ -22,8 +31,12 @@ harness = false
 name = "steal"
 harness = false
 
+[[bench]]
+name = "claim_release"
+harness = false
+
 [target."cfg(loom)".dependencies]
-loom = "0.7.2"
+loom = { version = "0.7.2", features = ["futures"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }

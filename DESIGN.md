@@ -112,4 +112,25 @@ and released, nothing more.
 - Benchmark the no-reservoir design against a **central-atomic reservoir** variant
   and see what it buys.
 - **Weighted / batch `claim(n)`** (all-or-nothing, with rollback on partial).
-- A **blocking / async waiting** variant layered over the non-blocking core.
+- A **blocking** waiting variant (the async one is below).
+
+## Async waiting (`async` feature)
+
+- `Pool::claim` / `claim_owned`: try, else **register** a waiter, **retry**,
+  and only then sleep until notified; loop. Cancel safe: a cancelled waiter
+  holds nothing, and passes on a notification it was sent.
+- **Every deposit notifies**: releases, banking a stolen batch, a newcomer's
+  carved share, and redistribution on leave. A waiter's retry can miss
+  permits that are in flight between shards; whoever lands them wakes it.
+- **No lost wakeups** (Dekker): a depositor adds with a `SeqCst` RMW, then
+  `SeqCst`-loads the waiter count; a waiter increments the count, then
+  `fence(SeqCst)`, then retries. Either the depositor sees the waiter, or the
+  retry sees the deposit. `high_water` is raised (`SeqCst`) before a
+  newcomer's share is deposited, so the retry also scans the new shard.
+- **Hot path**: on x86 the `SeqCst` add costs what the `Relaxed` one did, and
+  the count is a read-mostly line of its own; nobody waiting costs one load.
+  The waiter queue (a mutex-guarded FIFO) is only touched when someone waits.
+- Woken FIFO, but no hand-off: a woken waiter re-competes, so **no fairness**.
+- Loom treats `SeqCst` accesses as `AcqRel`, so under `--cfg loom` the
+  depositor side uses the equivalent `fence(SeqCst)`, which loom models.
+
