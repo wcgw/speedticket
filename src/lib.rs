@@ -42,6 +42,10 @@
 //! let shared = std::sync::Arc::clone(&limit);
 //! std::thread::spawn(move || shared.try_claim().is_some());
 //! ```
+//!
+//! On a multi-threaded async runtime, whose tasks migrate between threads
+//! while holding a permit, use a [`Pool`] instead. With the `async` feature,
+//! `Pool::claim` waits for a permit rather than failing.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -49,6 +53,8 @@
 mod pool;
 mod shard;
 mod sync;
+#[cfg(feature = "async")]
+mod wait;
 
 pub use pool::{OwnedPermit, Pool, PoolPermit};
 
@@ -56,7 +62,7 @@ use std::cell::Cell;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::sync::PoisonError;
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::Ordering::{Relaxed, SeqCst};
 use std::{error, fmt, thread};
 
 use shard::Shard;
@@ -100,6 +106,9 @@ struct Shared {
     /// deregistration paths. Claims and releases never take it.
     registry: Mutex<Registry>,
     first_slot: FirstSlot,
+    /// Claims waiting for permits; every deposit notifies it.
+    #[cfg(feature = "async")]
+    waiters: wait::WaitQueue,
 }
 
 /// The slot that holds the whole budget at creation.
@@ -279,6 +288,8 @@ impl Shared {
             vacancies: AtomicUsize::new(capacity - 1),
             registry: Mutex::new(Registry { occupied }),
             first_slot,
+            #[cfg(feature = "async")]
+            waiters: wait::WaitQueue::new(),
         })
     }
 
@@ -316,10 +327,12 @@ impl Shared {
             let taken = self.shards[peer].take(|idle| idle.saturating_sub(target).min(need));
             need -= taken;
         }
-        self.shards[slot].give(target - need);
+        // Raised before the deposit, and `SeqCst` like it, so a waiter that
+        // sees the deposit also scans this slot (see `wait.rs`).
+        self.high_water.fetch_max(slot + 1, SeqCst);
+        self.give(slot, target - need);
 
         registry.occupied[slot] = true;
-        self.high_water.fetch_max(slot + 1, Relaxed);
         self.vacancies.fetch_sub(1, Relaxed);
         Ok(slot)
     }
@@ -336,7 +349,7 @@ impl Shared {
         let peers = self.participants(&registry).count() as u64;
         if peers == 0 {
             if self.first_slot == FirstSlot::Home {
-                self.shards[FIRST_SLOT].give(idle);
+                self.give(FIRST_SLOT, idle);
             }
             // Otherwise this was the last participant: the pool, and its
             // permits, are gone.
@@ -344,8 +357,17 @@ impl Shared {
         }
         let (share, remainder) = (idle / peers, idle % peers);
         for (i, peer) in (0u64..).zip(self.participants(&registry)) {
-            self.shards[peer].give(share + u64::from(i < remainder));
+            self.give(peer, share + u64::from(i < remainder));
         }
+    }
+
+    /// Deposits `n` permits into `slot`'s shard, waking any claims waiting
+    /// for them. Every deposit goes through here.
+    #[inline]
+    fn give(&self, slot: usize, n: u64) {
+        self.shards[slot].give(n);
+        #[cfg(feature = "async")]
+        self.waiters.notify(n);
     }
 
     /// Claims one permit for `slot`: from its own shard, else by stealing.
@@ -371,7 +393,7 @@ impl Shared {
             .find(|&stolen| stolen > 0);
         match stolen {
             Some(stolen) => {
-                self.shards[slot].give(stolen - 1);
+                self.give(slot, stolen - 1);
                 true
             }
             None => false,
@@ -398,7 +420,7 @@ impl Registry {
 impl Drop for Permit<'_> {
     #[inline]
     fn drop(&mut self) {
-        self.limit.shard().give(1);
+        self.limit.shared.give(self.limit.slot, 1);
     }
 }
 

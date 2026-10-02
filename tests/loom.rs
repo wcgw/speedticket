@@ -1,8 +1,10 @@
 //! Model-checked concurrency tests. Run with:
 //!
 //! ```sh
-//! RUSTFLAGS="--cfg loom" cargo test --release --test loom
+//! RUSTFLAGS="--cfg loom" cargo test --release --test loom --features async
 //! ```
+//!
+//! Without `--features async` the waiting models are skipped.
 //!
 //! Budgets and participant counts are kept tiny: loom explores every
 //! interleaving, and that space grows exponentially. Exploration is bounded to
@@ -286,4 +288,111 @@ fn pool_home_thread_joins_freed_slot() {
 
         assert_eq!(claim_all_from(&pool), TOTAL, "permits were lost or created");
     });
+}
+
+/// Loom reports a deadlock if a waiting claim is never woken, so these
+/// models need no assertion beyond completing.
+#[cfg(feature = "async")]
+mod waiting {
+    use super::*;
+    use loom::future::block_on;
+
+    /// A release wakes a claim waiting on an exhausted pool, however the
+    /// release interleaves with the claim registering and retrying.
+    #[test]
+    fn release_wakes_a_waiting_claim() {
+        model(|| {
+            let pool = std::sync::Arc::new(Pool::with_capacity(1, NonZeroUsize::new(2).unwrap()));
+            let held = pool.try_claim_owned().expect("the only permit");
+            let waiter = {
+                let pool = pool.clone();
+                thread::spawn(move || drop(block_on(pool.claim())))
+            };
+            drop(held);
+            waiter.join().unwrap();
+        });
+    }
+
+    /// A claim registers and retries while another thread's steal has a
+    /// permit in flight between shards: the thief's banking of the batch, or
+    /// its release, must wake the claim if its retry missed the permit.
+    #[test]
+    fn waiting_claim_is_woken_past_a_steal_in_flight() {
+        model(|| {
+            let pool = std::sync::Arc::new(Pool::with_capacity(2, NonZeroUsize::new(3).unwrap()));
+            // Main joins first, with both permits, and holds one.
+            let held = pool.try_claim_owned().expect("main's own share");
+            let thief = {
+                let pool = pool.clone();
+                // Joins with nothing to carve, so it must steal main's other
+                // permit; holds it briefly, then releases it.
+                thread::spawn(move || drop(pool.try_claim()))
+            };
+            let waiter = {
+                let pool = pool.clone();
+                thread::spawn(move || drop(block_on(pool.claim())))
+            };
+            drop(held);
+            thief.join().unwrap();
+            waiter.join().unwrap();
+        });
+    }
+
+    /// A thief banks part of its haul and keeps the rest: nothing is ever
+    /// released, so only the banking itself can wake a claim whose retry
+    /// missed the batch in flight.
+    #[test]
+    fn waiting_claim_is_woken_by_a_thiefs_banked_batch() {
+        model(|| {
+            // One participant slot: main takes it, with all four permits.
+            let pool = std::sync::Arc::new(Pool::with_capacity(4, NonZeroUsize::new(1).unwrap()));
+            drop(pool.try_claim());
+            let thief = {
+                let pool = pool.clone();
+                // At capacity, so on the home shard: steals half of main's
+                // idle permits, banks all but one at home, keeps that one.
+                thread::spawn(move || pool.try_claim().map(mem::forget))
+            };
+            let waiter = {
+                let pool = pool.clone();
+                thread::spawn(move || mem::forget(block_on(pool.claim())))
+            };
+            // Main keeps what it can of the rest; demand never exceeds four.
+            for _ in 0..2 {
+                if let Some(permit) = pool.try_claim() {
+                    mem::forget(permit);
+                }
+            }
+            thief.join().unwrap();
+            waiter.join().unwrap();
+        });
+    }
+
+    /// The oldest waiter is cancelled, concurrently with the release that
+    /// notifies it: the wake-up must reach the remaining waiter instead.
+    #[test]
+    fn cancelled_waiter_passes_its_wake_up_on() {
+        use std::future::Future;
+        use std::task::{Context, Waker};
+
+        model(|| {
+            let pool = std::sync::Arc::new(Pool::with_capacity(1, NonZeroUsize::new(3).unwrap()));
+            let held = pool.try_claim_owned().expect("the only permit");
+            let cancelled = {
+                let pool = pool.clone();
+                thread::spawn(move || {
+                    let mut claim = Box::pin(pool.claim());
+                    // Waits once (or wins outright), then gives up.
+                    let _ = claim.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+                })
+            };
+            let waiter = {
+                let pool = pool.clone();
+                thread::spawn(move || drop(block_on(pool.claim())))
+            };
+            drop(held);
+            cancelled.join().unwrap();
+            waiter.join().unwrap();
+        });
+    }
 }

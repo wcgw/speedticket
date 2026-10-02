@@ -81,6 +81,11 @@ async fn call() {
     };
     // `_permit` is `PoolPermit<'static>` and may be held across `.await`.
 }
+
+// With the `async` feature: wait for a permit instead of giving up.
+async fn queued_call() {
+    let _permit = POOL.claim().await;
+}
 ```
 
 A `static` hands out `PoolPermit<'static>`. Wherever the pool lives instead,
@@ -88,11 +93,17 @@ A `static` hands out `PoolPermit<'static>`. Wherever the pool lives instead,
 holds a reference-counted handle belonging to the thread that claimed it, so
 owned claims cost a little more than `try_claim`'s but scale just as well.
 Register a `Pool::leave_current_thread` hook with the runtime's
-`on_thread_stop` so a stopping worker returns its share right away. There is
-no async waiting yet: `try_claim` either succeeds or returns `None`.
+`on_thread_stop` so a stopping worker returns its share right away.
+
+With the `async` feature, `Pool::claim` and `Pool::claim_owned` wait for a
+permit when the pool is exhausted. They work with any executor (nothing
+depends on tokio) and are cancel safe. Waiters are woken in the order they
+started waiting, but a woken waiter still competes with every other claim, so
+there is no fairness guarantee. When nobody waits, the feature costs each
+release one extra load, which the benchmarks below cannot measure.
 
 [`examples/tokio.rs`](examples/tokio.rs) puts it together. Run it with
-`cargo run --example tokio`.
+`cargo run --example tokio --features async`.
 
 ## Benchmarks (preliminary)
 

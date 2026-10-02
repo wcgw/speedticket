@@ -232,6 +232,65 @@ impl Pool {
         self.shared.claim(slot).then(|| OwnedPermit { handle })
     }
 
+    /// Claims one permit, waiting for one to be released if the pool is
+    /// exhausted. Otherwise as [`Pool::try_claim`].
+    ///
+    /// Waiters are woken in the order they started waiting, but a woken
+    /// waiter still competes with every other claim, waiting or not: there is
+    /// no fairness guarantee.
+    ///
+    /// # Cancel safety
+    ///
+    /// This method is cancel safe. A cancelled claim holds no permit, and a
+    /// wake-up it was sent is passed on to the next waiter.
+    ///
+    /// ```
+    /// # poll_once(async {
+    /// let pool = speedticket::Pool::new(1);
+    /// let held = pool.claim().await;
+    /// assert!(pool.try_claim().is_none());
+    /// drop(held);
+    /// let _again = pool.claim().await;
+    /// # });
+    /// # fn poll_once(f: impl std::future::Future<Output = ()>) {
+    /// #     let mut f = std::pin::pin!(f);
+    /// #     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    /// #     assert!(f.as_mut().poll(&mut cx).is_ready());
+    /// # }
+    /// ```
+    #[cfg(feature = "async")]
+    pub async fn claim(&self) -> PoolPermit<'_> {
+        self.wait_for(|| self.try_claim()).await
+    }
+
+    /// As [`Pool::claim`], but the permit is `'static`, as with
+    /// [`Pool::try_claim_owned`].
+    ///
+    /// # Cancel safety
+    ///
+    /// This method is cancel safe, as [`Pool::claim`].
+    #[cfg(feature = "async")]
+    pub async fn claim_owned(&self) -> OwnedPermit {
+        self.wait_for(|| self.try_claim_owned()).await
+    }
+
+    /// Retries `try_claim` until it succeeds, waiting for a deposit between
+    /// attempts. Registering before the last attempt is what makes it safe
+    /// to sleep after it fails (see `wait.rs`).
+    #[cfg(feature = "async")]
+    async fn wait_for<P>(&self, try_claim: impl Fn() -> Option<P>) -> P {
+        loop {
+            if let Some(permit) = try_claim() {
+                return permit;
+            }
+            let wait = self.shared.waiters.register();
+            if let Some(permit) = try_claim() {
+                return permit;
+            }
+            wait.await;
+        }
+    }
+
     /// Deregisters the current thread now rather than when it exits, handing
     /// its idle permits to its peers. A later claim on this thread registers
     /// it again.
@@ -312,7 +371,7 @@ fn release(shared: &Shared, token: *const ()) {
         .ok()
         .flatten()
         .unwrap_or(HOME);
-    shared.shards[slot].give(1);
+    shared.give(slot, 1);
 }
 
 impl fmt::Debug for Pool {
@@ -579,5 +638,133 @@ mod tests {
             .map_while(|_| pool.try_claim().map(mem::forget))
             .count();
         assert_eq!(claimed as u64, TOTAL);
+    }
+
+    /// Polls `future` to completion on this thread, parking between polls.
+    #[cfg(feature = "async")]
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        use std::sync::Arc;
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct Unpark(thread::Thread);
+        impl Wake for Unpark {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+
+        let waker = Waker::from(Arc::new(Unpark(thread::current())));
+        let mut cx = Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+        loop {
+            match future.as_mut().poll(&mut cx) {
+                Poll::Ready(output) => return output,
+                Poll::Pending => thread::park(),
+            }
+        }
+    }
+
+    #[cfg(feature = "async")]
+    #[test]
+    fn claim_futures_are_send() {
+        fn assert_send<T: Send>(_: &T) {}
+        let pool = Pool::new(1);
+        assert_send(&pool.claim());
+        assert_send(&pool.claim_owned());
+    }
+
+    #[cfg(feature = "async")]
+    #[test]
+    fn release_on_another_thread_wakes_a_waiting_claim() {
+        let pool = Pool::with_capacity(1, cap(2));
+        let held = pool.try_claim_owned().unwrap();
+        thread::scope(|s| {
+            let waiter = s.spawn(|| block_on(pool.claim()));
+            // Give the waiter time to park; the result does not depend on it.
+            thread::sleep(std::time::Duration::from_millis(20));
+            drop(held);
+            drop(waiter.join().unwrap());
+        });
+    }
+
+    #[cfg(feature = "async")]
+    #[test]
+    fn cancelled_waiter_passes_its_wake_up_on() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+        use std::task::{Context, Poll, Wake, Waker};
+
+        #[derive(Default)]
+        struct Count(AtomicUsize);
+        impl Wake for Count {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Relaxed);
+            }
+        }
+
+        let pool = Pool::with_capacity(1, cap(1));
+        let held = pool.try_claim().unwrap();
+        let (first, second) = (Arc::new(Count::default()), Arc::new(Count::default()));
+        let (first_waker, second_waker) = (Waker::from(first.clone()), Waker::from(second.clone()));
+
+        let mut a = Box::pin(pool.claim());
+        let mut b = Box::pin(pool.claim());
+        assert!(
+            a.as_mut()
+                .poll(&mut Context::from_waker(&first_waker))
+                .is_pending()
+        );
+        assert!(
+            b.as_mut()
+                .poll(&mut Context::from_waker(&second_waker))
+                .is_pending()
+        );
+
+        drop(held); // notifies `a`, the oldest waiter
+        assert_eq!((first.0.load(Relaxed), second.0.load(Relaxed)), (1, 0));
+        drop(a); // cancelled before using it: `b` must hear instead
+        assert_eq!(second.0.load(Relaxed), 1);
+        let Poll::Ready(_permit) = b.as_mut().poll(&mut Context::from_waker(&second_waker)) else {
+            panic!("the passed-on wake-up should find the released permit");
+        };
+    }
+
+    #[cfg(feature = "async")]
+    #[test]
+    fn waiting_claims_never_over_admit_or_stall() {
+        const TOTAL: u64 = 2;
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 5_000;
+
+        let pool = Pool::with_capacity(TOTAL, cap(THREADS / 2));
+        let (in_use, peak) = (AtomicU64::new(0), AtomicU64::new(0));
+        thread::scope(|s| {
+            let workers: Vec<_> = (0..THREADS)
+                .map(|i| {
+                    let (pool, in_use, peak) = (&pool, &in_use, &peak);
+                    s.spawn(move || {
+                        for round in 0..ROUNDS {
+                            // Counted only while a permit is held.
+                            let count = || {
+                                let now = in_use.fetch_add(1, Relaxed) + 1;
+                                peak.fetch_max(now, Relaxed);
+                                in_use.fetch_sub(1, Relaxed);
+                            };
+                            if (i + round) % 2 == 0 {
+                                let _permit = block_on(pool.claim_owned());
+                                count();
+                            } else {
+                                let _permit = block_on(pool.claim());
+                                count();
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        });
+        assert!(peak.load(Relaxed) <= TOTAL);
     }
 }

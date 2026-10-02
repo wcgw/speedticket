@@ -5,7 +5,7 @@
 //! `.await`, so the runtime may resume it on another worker thread and the
 //! permit is released there, into that worker's own shard.
 //!
-//! Run with `cargo run --example tokio`.
+//! Run with `cargo run --example tokio --features async`.
 
 // tokio has no `Builder::on_thread_stop` under `--cfg loom`; there is nothing
 // to model-check here, so loom builds get an empty `main`.
@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::thread;
 use std::time::Duration;
 
-use speedticket::{Pool, PoolPermit};
+use speedticket::Pool;
 
 const WORKERS: usize = 4;
 const BUDGET: u64 = 8;
@@ -71,7 +71,9 @@ fn main() {
 
 /// One outbound call, made only while holding a permit.
 async fn call() {
-    let permit = claim().await;
+    // Waits while the budget is spent. To shed load instead, call
+    // `POOL.try_claim()` once and reject the work on `None`.
+    let permit = POOL.claim().await;
     let claimed_on = thread::current().id();
     let now = IN_FLIGHT.fetch_add(1, Relaxed) + 1;
     PEAK.fetch_max(now, Relaxed);
@@ -85,20 +87,4 @@ async fn call() {
     }
     // Released into the shard of whichever worker is running us now.
     drop(permit);
-}
-
-/// Waits for a permit by retrying with a capped backoff.
-///
-/// `Pool` has no async wait queue yet, so this polls, and waiters are not
-/// served in order. To shed load instead, call `POOL.try_claim()` once and
-/// reject the work on `None`.
-async fn claim() -> PoolPermit<'static> {
-    let mut backoff = Duration::from_micros(50);
-    loop {
-        if let Some(permit) = POOL.try_claim() {
-            return permit;
-        }
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(Duration::from_millis(5));
-    }
 }
