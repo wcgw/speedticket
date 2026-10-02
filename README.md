@@ -60,6 +60,40 @@ it elsewhere is a compile error. A participant can join at any time with
 `max(available_parallelism, 16)` participants; use `Limit::with_capacity` to set
 the limit yourself).
 
+### With tokio (or any runtime whose tasks migrate)
+
+On a multi-threaded runtime, tasks move between worker threads, so a permit
+held across an `.await` may be released on a different thread from the one that
+claimed it. Use `Pool` instead: it is `Sync`, binds each thread to its own
+shard on that thread's first claim, and its permits are `Send` and released
+into the shard of whichever thread drops them.
+
+```rust
+use std::sync::LazyLock;
+
+use speedticket::Pool;
+
+static POOL: LazyLock<Pool> = LazyLock::new(|| Pool::new(64));
+
+async fn call() {
+    let Some(_permit) = POOL.try_claim() else {
+        return; // over budget: shed the work, or retry later
+    };
+    // `_permit` is `PoolPermit<'static>` and may be held across `.await`.
+}
+```
+
+A `static` hands out `PoolPermit<'static>`. Wherever the pool lives instead,
+`try_claim_owned` returns an `OwnedPermit` that is `'static` too: each one
+holds a reference-counted handle belonging to the thread that claimed it, so
+claiming stays as cheap as with `try_claim`. Register a
+`Pool::leave_current_thread` hook with the runtime's `on_thread_stop` so a
+stopping worker returns its share right away. There is no async waiting yet: `try_claim` either succeeds
+or returns `None`.
+
+[`examples/tokio.rs`](examples/tokio.rs) puts it together. Run it with
+`cargo run --example tokio`.
+
 ## Benchmarks (preliminary)
 
 Both benches compare `speedticket` against a baseline semaphore built on a

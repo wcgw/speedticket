@@ -13,6 +13,7 @@ categories = ["concurrency"]
 
 [dev-dependencies]
 criterion = "0.8.2"
+tokio = { version = "1.53.1", default-features = false, features = ["rt-multi-thread", "sync", "time"] }
 
 [[bench]]
 name = "fill_drain"
@@ -20,6 +21,10 @@ harness = false
 
 [[bench]]
 name = "steal"
+harness = false
+
+[[bench]]
+name = "claim_release"
 harness = false
 
 [target."cfg(loom)".dependencies]

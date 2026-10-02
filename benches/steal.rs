@@ -21,7 +21,9 @@ use std::hint::black_box;
 use std::iter;
 use std::time::Duration;
 
-use common::{Participant, THREAD_COUNTS, TOTAL, race, sharded, single_atomic};
+use common::{
+    Participant, THREAD_COUNTS, TOTAL, pool, race, sharded, single_atomic, tokio_semaphore,
+};
 use criterion::{Criterion, criterion_group, criterion_main};
 
 /// Permits each thread gives back per round: 1 stresses the scan (peers are
@@ -48,6 +50,12 @@ fn bench(c: &mut Criterion) {
             ));
             group.bench_function("speedticket", |b| {
                 b.iter_custom(|rounds| exhaustion_churn(sharded(threads), churn, rounds));
+            });
+            group.bench_function("pool", |b| {
+                b.iter_custom(|rounds| exhaustion_churn(pool(threads), churn, rounds));
+            });
+            group.bench_function("tokio", |b| {
+                b.iter_custom(|rounds| exhaustion_churn(tokio_semaphore(threads), churn, rounds));
             });
             group.bench_function("single_atomic", |b| {
                 b.iter_custom(|rounds| exhaustion_churn(single_atomic(threads), churn, rounds));
