@@ -234,6 +234,7 @@ impl Limit {
     /// assert!(second.try_claim().is_none());
     /// # Ok::<(), speedticket::AtCapacity>(())
     /// ```
+    #[inline]
     pub fn try_claim(&self) -> Option<Permit<'_>> {
         // Build the `Permit` only on success: dropping one releases a permit.
         self.shared.claim(self.slot).then(|| Permit { limit: self })
@@ -348,6 +349,7 @@ impl Shared {
     }
 
     /// Claims one permit for `slot`: from its own shard, else by stealing.
+    #[inline]
     fn claim(&self, slot: usize) -> bool {
         self.shards[slot].take(|_| 1) == 1 || self.steal(slot)
     }
@@ -355,6 +357,8 @@ impl Shared {
     /// Steals a batch from the first peer with idle permits, keeping one as
     /// the claimed permit and banking the rest in `slot`. Visits each peer at
     /// most once, starting just after `slot`.
+    #[cold]
+    #[inline(never)]
     fn steal(&self, slot: usize) -> bool {
         let scanned = &self.shards[..self.high_water.load(Relaxed)];
         // Peers after this slot, then wrapping round to those before it.
@@ -392,6 +396,7 @@ impl Registry {
 }
 
 impl Drop for Permit<'_> {
+    #[inline]
     fn drop(&mut self) {
         self.limit.shard().give(1);
     }

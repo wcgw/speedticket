@@ -198,6 +198,7 @@ impl Pool {
 
     /// Claims one permit without blocking, registering the current thread as
     /// a participant on its first claim. Otherwise as [`Limit::try_claim`].
+    #[inline]
     pub fn try_claim(&self) -> Option<PoolPermit<'_>> {
         let token = self.token();
         let slot = LOCAL
@@ -298,6 +299,7 @@ impl Pool {
 /// by `token`, or to [`HOME`] if it has none. Depositing only into this
 /// thread's own participant, or into the home shard, keeps
 /// [`Shared::leave`] sound: a slot's owner is the only one to refill it.
+#[inline]
 fn release(shared: &Shared, token: *const ()) {
     let slot = LOCAL
         .try_with(|local| {
@@ -328,6 +330,7 @@ impl fmt::Debug for OwnedPermit {
 }
 
 impl Drop for PoolPermit<'_> {
+    #[inline]
     fn drop(&mut self) {
         release(&self.pool.shared, self.pool.token());
     }
