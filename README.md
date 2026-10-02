@@ -66,9 +66,13 @@ Both benches compare `speedticket` against a baseline semaphore built on a
 single shared `AtomicU64`, with a budget of 1000 permits. Run them with
 `cargo bench`.
 
-These numbers come from single criterion runs on one laptop (Intel Core Ultra 7
-255U, 14 logical CPUs, no CPU pinning or frequency control). Repeated runs on
-this machine vary by about ±8%, so treat them as indicative only.
+These numbers come from a single criterion run on one desktop (AMD Ryzen 9 7900,
+12 cores / 24 threads in two 6-core CCDs). The process was pinned with
+`taskset -c 6-11` to the six physical cores of one CCD, which share an L3, with
+their SMT siblings left idle. Boost was off, with the `performance` governor and
+EPP, so clocks were capped at the 3.7 GHz base. Across three runs, results
+varied by under 3%, except the single-atomic `steal` numbers, which varied by up
+to 20%. Treat them as indicative only.
 
 ### `fill_drain`: race to exhaustion, then release everything
 
@@ -79,8 +83,8 @@ pay.
 
 | threads | speedticket | single atomic | speedup |
 |--------:|------------:|--------------:|--------:|
-| 4       | 23.6 µs     | 224 µs        | ~9.5×   |
-| 6       | 31.2 µs     | 300 µs        | ~9.6×   |
+| 4       | 8.47 µs     | 13.8 µs       | ~1.6×   |
+| 6       | 13.4 µs     | 19.7 µs       | ~1.5×   |
 
 ### `steal`: pinned at exhaustion
 
@@ -90,16 +94,16 @@ no barriers between threads. This forces claims onto the steal path, where
 
 | threads | churn | speedticket | single atomic | ratio          |
 |--------:|------:|------------:|--------------:|---------------:|
-| 4       | 1     | 484 ns      | 399 ns        | ~1.2× slower   |
-| 4       | 4     | 1.69 µs     | 2.75 µs       | ~1.6× faster   |
-| 6       | 1     | 664 ns      | 698 ns        | about even     |
-| 6       | 4     | 2.58 µs     | 5.00 µs       | ~1.9× faster   |
+| 4       | 1     | 398 ns      | 47.4 ns       | ~8.4× slower   |
+| 4       | 4     | 1.12 µs     | 418 ns        | ~2.7× slower   |
+| 6       | 1     | 762 ns      | 66.3 ns       | ~11.5× slower  |
+| 6       | 4     | 2.27 µs     | 589 ns        | ~3.8× slower   |
 
 With a churn of 1, most claims end with a search of every peer that finds
 nothing. That search reads one cache line per peer, while the single atomic
 needs just one read, so this is `speedticket`'s worst case. Once peers have
-permits to give (churn 4), sharding wins again, and by more as the thread count
-grows.
+permits to give (churn 4), the gap narrows, but the single atomic still wins on
+this machine.
 
 ## License
 
