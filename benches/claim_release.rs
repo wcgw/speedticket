@@ -18,7 +18,8 @@ use common::{
 };
 use criterion::{Criterion, criterion_group, criterion_main};
 
-const THREAD_COUNTS: [usize; 5] = [1, 2, 4, 8, 12];
+/// At most 8: the README numbers come from runs pinned to 8 identical cores.
+const THREAD_COUNTS: [usize; 4] = [1, 2, 4, 8];
 
 /// Runs `rounds` claim-then-release rounds on every thread.
 fn claim_release<P: Participant>(participants: Vec<P>, rounds: u64) -> Duration {

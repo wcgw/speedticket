@@ -2,7 +2,7 @@
 //! (e.g. tokio's multi-threaded scheduler) whose tasks migrate between
 //! threads while holding a permit.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::num::NonZeroUsize;
 // Plain `std` even under loom: these only track handles and whether a `Pool`
@@ -17,10 +17,29 @@ use crate::{FIRST_SLOT, FirstSlot, Limit, MIN_DEFAULT_CAPACITY, Shared};
 /// from and release into it.
 const HOME: usize = FIRST_SLOT;
 
+// A `const` initialiser spares every access a lazy-init check; loom's
+// `thread_local!` has no `const` form.
+#[cfg(not(loom))]
 thread_local! {
-    /// This thread's bindings, one per [`Pool`] it has claimed from.
-    #[allow(clippy::missing_const_for_thread_local, reason = "loom's `thread_local!` has no `const` form")]
-    static BINDINGS: RefCell<Vec<Binding>> = RefCell::new(Vec::new());
+    static LOCAL: Local = const { Local::new() };
+}
+#[cfg(loom)]
+thread_local! {
+    static LOCAL: Local = Local::new();
+}
+
+/// This thread's state across every [`Pool`] it has claimed from. One
+/// thread-local rather than two, so the pieces are torn down in a fixed
+/// order when the thread exits.
+struct Local {
+    /// The binding this thread used last, if it has a participant: claims
+    /// and releases on that pool skip `bindings`.
+    recent: Cell<Recent>,
+    /// That binding's handle, kept apart so that only owned claims pay to
+    /// move it in and out of its cell.
+    recent_handle: Cell<Option<StdArc<Handle>>>,
+    /// One binding per pool.
+    bindings: RefCell<Vec<Binding>>,
 }
 
 /// A shared, finite budget of permits that any thread may claim from.
@@ -87,6 +106,71 @@ struct Handle {
     pool: Weak<()>,
 }
 
+impl Local {
+    const fn new() -> Self {
+        Self {
+            recent: Cell::new(Recent::NONE),
+            recent_handle: Cell::new(None),
+            bindings: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// This thread's slot in the pool identified by `token`, if cached.
+    fn recent_slot(&self, token: *const ()) -> Option<usize> {
+        let recent = self.recent.get();
+        (recent.pool == token).then_some(recent.slot)
+    }
+
+    /// As [`Local::recent_slot`], with a clone of the binding's handle.
+    fn recent_handle(&self, token: *const ()) -> Option<(usize, StdArc<Handle>)> {
+        let slot = self.recent_slot(token)?;
+        let handle = self.recent_handle.take()?;
+        // Clone needed: the caller's permit holds this thread's handle.
+        let clone = StdArc::clone(&handle);
+        self.recent_handle.set(Some(handle));
+        Some((slot, clone))
+    }
+
+    /// Caches `binding` if it has a participant, replacing what was cached.
+    fn remember(&self, binding: &Binding) {
+        if let Some(limit) = &binding.limit {
+            self.recent.set(Recent {
+                pool: binding.handle.pool.as_ptr(),
+                slot: limit.slot,
+            });
+            // Clone needed: the cache holds this thread's handle too.
+            self.recent_handle.set(Some(StdArc::clone(&binding.handle)));
+        }
+    }
+
+    /// Empties the cache if it holds the binding for `token`.
+    fn forget(&self, token: *const ()) {
+        if self.recent.get().pool == token {
+            self.recent.set(Recent::NONE);
+            self.recent_handle.set(None);
+        }
+    }
+}
+
+/// Which slot the [`Binding`] a thread used last gives it. Only bindings
+/// with a participant are cached, and a binding clears the cache as it
+/// drops, so a hit never names a slot the thread has left.
+#[derive(Clone, Copy)]
+struct Recent {
+    /// The pool's token. The binding's weak reference keeps the token's
+    /// allocation, and so this address, from being reused while cached.
+    pool: *const (),
+    slot: usize,
+}
+
+impl Recent {
+    /// Nothing cached: no pool's token is null.
+    const NONE: Self = Self {
+        pool: std::ptr::null(),
+        slot: HOME,
+    };
+}
+
 /// One thread's registration with one pool.
 struct Binding {
     handle: StdArc<Handle>,
@@ -115,29 +199,36 @@ impl Pool {
     /// Claims one permit without blocking, registering the current thread as
     /// a participant on its first claim. Otherwise as [`Limit::try_claim`].
     pub fn try_claim(&self) -> Option<PoolPermit<'_>> {
-        let claimed = BINDINGS
-            .try_with(|bindings| {
-                let slot = self.bind(&mut bindings.borrow_mut()).slot();
-                self.shared.claim(slot)
+        let token = self.token();
+        let slot = LOCAL
+            .try_with(|local| {
+                local
+                    .recent_slot(token)
+                    .unwrap_or_else(|| self.bind(local, Binding::slot))
             })
             // The thread is exiting and its bindings are gone.
-            .unwrap_or_else(|_| self.shared.claim(HOME));
-        claimed.then(|| PoolPermit { pool: self })
+            .unwrap_or(HOME);
+        self.shared.claim(slot).then(|| PoolPermit { pool: self })
     }
 
     /// As [`Pool::try_claim`], but the permit is `'static`.
     pub fn try_claim_owned(&self) -> Option<OwnedPermit> {
-        let handle = BINDINGS
-            .try_with(|bindings| {
-                let mut bindings = bindings.borrow_mut();
-                let binding = self.bind(&mut bindings);
-                // Clone needed: the permit holds this thread's handle.
-                let handle = || StdArc::clone(&binding.handle);
-                self.shared.claim(binding.slot()).then(handle)
+        // The permit holds a clone of this thread's handle. On a denied claim
+        // it is dropped again, on this thread's own cache line.
+        let token = self.token();
+        let (slot, handle) = LOCAL
+            .try_with(|local| {
+                local.recent_handle(token).unwrap_or_else(|| {
+                    // Clone needed: the permit holds this thread's handle.
+                    self.bind(local, |binding| {
+                        (binding.slot(), StdArc::clone(&binding.handle))
+                    })
+                })
             })
             // The thread is exiting: a handle of its own, just this once.
-            .unwrap_or_else(|_| self.shared.claim(HOME).then(|| StdArc::new(self.handle())))?;
-        Some(OwnedPermit { handle })
+            .unwrap_or_else(|_| (HOME, StdArc::new(self.handle())));
+        // Build the permit only on success: dropping one releases a permit.
+        self.shared.claim(slot).then(|| OwnedPermit { handle })
     }
 
     /// Deregisters the current thread now rather than when it exits, handing
@@ -149,9 +240,9 @@ impl Pool {
     /// on thread-local destructors.
     pub fn leave_current_thread(&self) {
         let token = self.token();
-        let binding = BINDINGS
-            .try_with(|bindings| {
-                let mut bindings = bindings.borrow_mut();
+        let binding = LOCAL
+            .try_with(|local| {
+                let mut bindings = local.bindings.borrow_mut();
                 let index = bindings.iter().position(|binding| binding.is(token))?;
                 Some(bindings.swap_remove(index))
             })
@@ -161,9 +252,11 @@ impl Pool {
         drop(binding);
     }
 
-    /// Returns the current thread's binding, creating it if needed, and
-    /// registering a participant if it has none and a slot may be free.
-    fn bind<'b>(&self, bindings: &'b mut Vec<Binding>) -> &'b Binding {
+    /// Applies `f` to the current thread's binding, creating it if needed and
+    /// registering a participant if it has none and a slot may be free, then
+    /// caches it in `local` for next time.
+    fn bind<R>(&self, local: &Local, f: impl FnOnce(&Binding) -> R) -> R {
+        let mut bindings = local.bindings.borrow_mut();
         let token = self.token();
         let index = match bindings.iter().position(|binding| binding.is(token)) {
             Some(index) => index,
@@ -185,7 +278,8 @@ impl Pool {
                 .ok()
                 .map(|slot| Limit::from_parts(Arc::clone(&self.shared), slot));
         }
-        binding
+        local.remember(binding);
+        f(binding)
     }
 
     fn handle(&self) -> Handle {
@@ -205,11 +299,13 @@ impl Pool {
 /// thread's own participant, or into the home shard, keeps
 /// [`Shared::leave`] sound: a slot's owner is the only one to refill it.
 fn release(shared: &Shared, token: *const ()) {
-    let slot = BINDINGS
-        .try_with(|bindings| {
-            let bindings = bindings.try_borrow().ok()?;
-            let binding = bindings.iter().find(|binding| binding.is(token))?;
-            Some(binding.slot())
+    let slot = LOCAL
+        .try_with(|local| {
+            local.recent_slot(token).or_else(|| {
+                let bindings = local.bindings.try_borrow().ok()?;
+                let binding = bindings.iter().find(|binding| binding.is(token))?;
+                Some(binding.slot())
+            })
         })
         .ok()
         .flatten()
@@ -240,6 +336,16 @@ impl Drop for PoolPermit<'_> {
 impl Drop for OwnedPermit {
     fn drop(&mut self) {
         release(&self.handle.shared, self.handle.pool.as_ptr());
+    }
+}
+
+impl Drop for Binding {
+    /// Clears the binding from its thread's cache before its participant
+    /// leaves.
+    fn drop(&mut self) {
+        let token = self.handle.pool.as_ptr();
+        // Fails while the thread exits, when the cache is being dropped too.
+        let _ = LOCAL.try_with(|local| local.forget(token));
     }
 }
 
@@ -350,7 +456,7 @@ mod tests {
             s.spawn(|| {
                 let permit = pool.try_claim().expect("from home");
                 drop(permit);
-                assert!(BINDINGS.with(|b| b.borrow().iter().all(|b| b.limit.is_none())));
+                assert!(LOCAL.with(|l| l.bindings.borrow().iter().all(|b| b.limit.is_none())));
             });
         });
         assert_eq!(pool_idle(&pool), 3);
@@ -372,7 +478,7 @@ mod tests {
     fn thread_on_home_shard_joins_once_a_slot_frees() {
         let pool = Pool::with_capacity(4, cap(1));
         let (joined, left) = (Barrier::new(2), Barrier::new(2));
-        let is_participant = || BINDINGS.with(|b| b.borrow()[0].limit.is_some());
+        let is_participant = || LOCAL.with(|l| l.bindings.borrow()[0].limit.is_some());
         thread::scope(|s| {
             s.spawn(|| {
                 drop(pool.try_claim()); // takes the only slot
@@ -415,7 +521,7 @@ mod tests {
         drop(first);
         let second = Pool::with_capacity(2, cap(1));
         drop(second.try_claim());
-        assert_eq!(BINDINGS.with(|b| b.borrow().len()), 1);
+        assert_eq!(LOCAL.with(|l| l.bindings.borrow().len()), 1);
     }
 
     #[test]
