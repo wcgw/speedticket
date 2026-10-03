@@ -125,8 +125,9 @@ taskset -c 6-11 cargo bench -- '/[1246]_threads/'
 taskset -c 2-9 cargo bench -- '/8_threads/'
 ```
 
-Across three runs, 41 of the 60 results varied by under 10%, but some varied by
-up to 17% (`speedticket`) and 37% (tokio). Treat them as indicative only.
+Across three runs, 51 of the 60 results varied by under 10%, but some varied by
+up to 13% (`speedticket`), 19% (single atomic) and 25% (tokio). Treat them as
+indicative only.
 
 ### `claim_release`: the common case
 
@@ -138,16 +139,16 @@ holding one across an `.await` would (`Pool::try_claim_owned`,
 
 | threads | `Limit` | `Pool`  | `Pool` owned | tokio   | tokio owned | single atomic |
 |--------:|--------:|--------:|-------------:|--------:|------------:|--------------:|
-| 1       | 4.54 ns | 4.60 ns | 8.73 ns      | 8.82 ns | 13.2 ns     | 4.53 ns       |
-| 2       | 4.53 ns | 4.60 ns | 8.72 ns      | 122 ns  | 149 ns      | 37.8 ns       |
-| 4       | 4.56 ns | 4.60 ns | 8.85 ns      | 335 ns  | 400 ns      | 77.9 ns       |
-| 8       | 4.98 ns | 5.18 ns | 10.0 ns      | 778 ns  | 965 ns      | 317 ns        |
+| 1       | 4.55 ns | 4.62 ns | 8.73 ns      | 8.84 ns | 13.3 ns     | 4.54 ns       |
+| 2       | 4.56 ns | 4.62 ns | 9.78 ns      | 117 ns  | 154 ns      | 36.2 ns       |
+| 4       | 4.55 ns | 4.63 ns | 9.45 ns      | 379 ns  | 451 ns      | 78.8 ns       |
+| 8       | 5.24 ns | 5.34 ns | 9.76 ns      | 738 ns  | 946 ns      | 339 ns        |
 
 Both `speedticket` variants stay flat as threads are added, because each thread
 claims and releases against its own shard. Every other variant contends on one
 shared counter, and `tokio::sync::Semaphore` also takes a lock on every
 release, so they slow down as soon as a second thread joins: at 8 threads,
-spread over both CCDs, `Pool` is about 150× faster than tokio, and its owned
+spread over both CCDs, `Pool` is about 140× faster than tokio, and its owned
 permits about 95× faster than tokio's.
 
 ### `fill_drain`: race to exhaustion, then release everything
@@ -159,9 +160,9 @@ pays.
 
 | threads | `Limit` | `Pool`  | tokio   | single atomic |
 |--------:|--------:|--------:|--------:|--------------:|
-| 4       | 8.83 µs | 9.01 µs | 26.2 µs | 14.5 µs       |
-| 6       | 14.3 µs | 13.9 µs | 41.6 µs | 21.2 µs       |
-| 8       | 30.4 µs | 29.5 µs | 100 µs  | 49.5 µs       |
+| 4       | 8.53 µs | 8.22 µs | 31.5 µs | 13.9 µs       |
+| 6       | 12.8 µs | 12.7 µs | 33.9 µs | 19.6 µs       |
+| 8       | 32.5 µs | 32.9 µs | 90.7 µs | 49.9 µs       |
 
 ### `steal`: pinned at exhaustion
 
@@ -171,20 +172,20 @@ no barriers between threads. This forces claims onto the steal path, where
 
 | threads | churn | `Limit` | `Pool`  | tokio   | single atomic |
 |--------:|------:|--------:|--------:|--------:|--------------:|
-| 4       | 1     | 339 ns  | 341 ns  | 393 ns  | 70.0 ns       |
-| 4       | 4     | 1.11 µs | 944 ns  | 1.41 µs | 391 ns        |
-| 6       | 1     | 715 ns  | 630 ns  | 523 ns  | 102 ns        |
-| 6       | 4     | 2.18 µs | 1.93 µs | 1.73 µs | 573 ns        |
-| 8       | 1     | 1.56 µs | 1.47 µs | 1.00 µs | 229 ns        |
-| 8       | 4     | 4.96 µs | 4.46 µs | 3.62 µs | 1.16 µs       |
+| 4       | 1     | 356 ns  | 343 ns  | 403 ns  | 62.0 ns       |
+| 4       | 4     | 1.02 µs | 866 ns  | 1.20 µs | 432 ns        |
+| 6       | 1     | 714 ns  | 675 ns  | 591 ns  | 88.4 ns       |
+| 6       | 4     | 1.86 µs | 1.67 µs | 1.94 µs | 584 ns        |
+| 8       | 1     | 1.38 µs | 1.21 µs | 847 ns  | 238 ns        |
+| 8       | 4     | 4.03 µs | 3.53 µs | 2.81 µs | 1.30 µs       |
 
 With a churn of 1, most claims end with a search of every peer that finds
 nothing, and every search reads cache lines that other cores keep changing.
 This is `speedticket`'s worst case: the single atomic needs just one read to
-say no, and is about 5–7× faster. Once peers have permits to give (churn 4),
-the gap narrows to about 2.4–4.3×, but the single atomic still wins at every
-thread count. tokio trails both `speedticket` variants at 4 threads but beats
-them at 6 and 8, by up to about 1.6×.
+say no, and is about 5–8× faster. Once peers have permits to give (churn 4),
+the gap narrows to about 2–3.2×, but the single atomic still wins at every
+thread count. tokio trails both `speedticket` variants at 4 threads, and at 6
+threads with churn 4; everywhere else it beats them, by up to about 1.6×.
 
 ## License
 

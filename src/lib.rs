@@ -63,7 +63,7 @@ use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::sync::PoisonError;
 use std::sync::atomic::Ordering::{Relaxed, SeqCst};
-use std::{error, fmt, thread};
+use std::{error, fmt, ptr, thread};
 
 use shard::Shard;
 use sync::{Arc, AtomicUsize, Mutex, MutexGuard};
@@ -228,8 +228,8 @@ impl Limit {
     ///
     /// Takes from this participant's own shard when it can. Otherwise it
     /// makes one bounded pass over its peers, stealing half the idle permits
-    /// of the first one that has any; if that pass finds nothing it returns
-    /// `None` rather than wait.
+    /// of the one with the most; if that pass finds nothing it returns `None`
+    /// rather than wait.
     ///
     /// The number of simultaneously claimed permits never exceeds the pool's
     /// total. A claim may, rarely, return `None` while a permit is in flight
@@ -376,21 +376,38 @@ impl Shared {
         self.shards[slot].take(|_| 1) == 1 || self.steal(slot)
     }
 
-    /// Steals a batch from the first peer with idle permits, keeping one as
-    /// the claimed permit and banking the rest in `slot`. Visits each peer at
-    /// most once, starting just after `slot`.
+    /// Steals a batch from the peer with the most idle permits, keeping one
+    /// as the claimed permit and banking the rest in `slot`. If a racing claim
+    /// empties that peer first, steals from the first other peer with any.
+    /// Takes from each peer at most once, starting just after `slot`.
     #[cold]
     #[inline(never)]
     fn steal(&self, slot: usize) -> bool {
         let scanned = &self.shards[..self.high_water.load(Relaxed)];
         // Peers after this slot, then wrapping round to those before it.
         let peers = scanned.iter().skip(slot + 1).chain(&scanned[..slot]);
-        if peers.clone().fold(0, |any, peer| any | peer.idle()) == 0 {
+        // The first of the richest peers in that order: its batch is the
+        // biggest, and its cache line was read just now.
+        let (richest, _) = peers.clone().fold((None, 0), |(richest, most), peer| {
+            let idle = peer.idle();
+            if idle > most {
+                (Some(peer), idle)
+            } else {
+                (richest, most)
+            }
+        });
+        let Some(richest) = richest else {
             return false;
-        }
-        let stolen = peers
-            .map(|peer| peer.take(|idle| (idle / 2).max(1)))
-            .find(|&stolen| stolen > 0);
+        };
+        let half = |idle: u64| (idle / 2).max(1);
+        let stolen = Some(richest.take(half))
+            .filter(|&stolen| stolen > 0)
+            .or_else(|| {
+                peers
+                    .filter(|&peer| !ptr::eq(peer, richest))
+                    .map(|peer| peer.take(half))
+                    .find(|&stolen| stolen > 0)
+            });
         match stolen {
             Some(stolen) => {
                 self.give(slot, stolen - 1);
@@ -522,6 +539,20 @@ mod tests {
         assert_eq!(idle(&b), 0);
         assert!(a.try_claim().is_none());
         assert!(b.try_claim().is_none());
+    }
+
+    #[test]
+    fn steal_prefers_the_richest_peer() {
+        let a = Limit::with_capacity(12, cap(3));
+        let b = a.participant().unwrap();
+        let c = a.participant().unwrap();
+        let _b_held: Vec<_> = (0..3).map_while(|_| b.try_claim()).collect();
+        let mut held: Vec<_> = (0..4).map_while(|_| a.try_claim()).collect();
+        assert_eq!((idle(&a), idle(&b), idle(&c)), (0, 1, 4));
+        held.push(a.try_claim().expect("steal from c"));
+        // a passes over b's single permit for half of c's four: one claimed,
+        // one banked locally.
+        assert_eq!((idle(&a), idle(&b), idle(&c)), (1, 1, 2));
     }
 
     #[test]

@@ -67,9 +67,11 @@ and released, nothing more.
 - `try_claim(&self) -> Option<Permit<'_>>`.
 - **Fast path:** a single uncontended atomic take on the owner's own shard.
 - **Exhausted:** one **bounded pass** over peers — rotating start `(self + 1) % N`,
-  lock-free CAS, steal `max(1, victim_idle / 2)` from the first peer that has idle
-  permits. If the whole pass gathers nothing, return `None` (fail-fast). The pass
-  visits each peer at most once, so a claim can never spin.
+  lock-free CAS, steal `max(1, victim_idle / 2)` from the peer with the most idle
+  permits (the first in rotation order on a tie). If a racing claim empties it
+  first, steal from the first other peer that has any. If the whole pass gathers
+  nothing, return `None` (fail-fast). The pass takes from each peer at most once,
+  so a claim can never spin.
 - **Hard upper bound:** the number of simultaneously-claimed permits never exceeds
   `total`, under any race.
 - **Best-effort lower bound:** a `claim` may *occasionally* return `None` even
