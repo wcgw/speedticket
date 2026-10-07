@@ -11,11 +11,7 @@ use std::sync::{Arc as StdArc, Weak};
 use std::thread;
 
 use crate::sync::{Arc, thread_local};
-use crate::{FIRST_SLOT, FirstSlot, Limit, MIN_DEFAULT_CAPACITY, Shared};
-
-/// The pool's home shard: threads without a participant of their own claim
-/// from and release into it.
-const HOME: usize = FIRST_SLOT;
+use crate::{Limit, MIN_DEFAULT_CAPACITY, RESERVE, Shared, Spill};
 
 // A `const` initialiser spares every access a lazy-init check; loom's
 // `thread_local!` has no `const` form.
@@ -38,6 +34,8 @@ struct Local {
     /// That binding's handle, kept apart so that only owned claims pay to
     /// move it in and out of its cell.
     recent_handle: Cell<Option<StdArc<Handle>>>,
+    /// This thread's spill state on that pool.
+    spill: Cell<Spill>,
     /// One binding per pool.
     bindings: RefCell<Vec<Binding>>,
 }
@@ -54,8 +52,8 @@ struct Local {
 /// A thread's participant is deregistered, handing its idle permits to its
 /// peers, when the thread exits or calls [`Pool::leave_current_thread`].
 /// Threads that find the pool at capacity, and permits dropped on threads
-/// that never claimed, use the pool's home shard instead, which they all
-/// contend on; a thread on the home shard registers once a slot frees up.
+/// that never claimed, use the pool's reserve instead, which they all
+/// contend on; a thread on the reserve registers once a slot frees up.
 ///
 /// Handing back on exit happens in a thread-local destructor. Joining a
 /// thread waits for those, but leaving a [`thread::scope`] does not, so call
@@ -111,6 +109,10 @@ impl Local {
         Self {
             recent: Cell::new(Recent::NONE),
             recent_handle: Cell::new(None),
+            spill: Cell::new(Spill {
+                score: 0,
+                spilling: false,
+            }),
             bindings: RefCell::new(Vec::new()),
         }
     }
@@ -134,8 +136,13 @@ impl Local {
     /// Caches `binding` if it has a participant, replacing what was cached.
     fn remember(&self, binding: &Binding) {
         if let Some(limit) = &binding.limit {
+            let pool = binding.handle.pool.as_ptr();
+            if self.recent.get().pool != pool {
+                // The spill state was for another pool.
+                self.spill.take();
+            }
             self.recent.set(Recent {
-                pool: binding.handle.pool.as_ptr(),
+                pool,
                 slot: limit.slot,
             });
             // Clone needed: the cache holds this thread's handle too.
@@ -148,6 +155,7 @@ impl Local {
         if self.recent.get().pool == token {
             self.recent.set(Recent::NONE);
             self.recent_handle.set(None);
+            self.spill.take();
         }
     }
 }
@@ -167,7 +175,7 @@ impl Recent {
     /// Nothing cached: no pool's token is null.
     const NONE: Self = Self {
         pool: std::ptr::null(),
-        slot: HOME,
+        slot: RESERVE,
     };
 }
 
@@ -175,7 +183,7 @@ impl Recent {
 struct Binding {
     handle: StdArc<Handle>,
     /// `None` while the thread has no participant: the pool was at capacity
-    /// when it last tried to join, so it uses [`HOME`].
+    /// when it last tried to join, so it uses the [`RESERVE`].
     limit: Option<Limit>,
 }
 
@@ -188,10 +196,10 @@ impl Pool {
     }
 
     /// Creates a pool of `total` permits accepting up to `max_threads`
-    /// participating threads. Further threads share the pool's home shard.
+    /// participating threads. Further threads share the pool's reserve.
     pub fn with_capacity(total: u64, max_threads: NonZeroUsize) -> Self {
         Self {
-            shared: Shared::new(total, max_threads.get() + 1, FirstSlot::Home),
+            shared: Shared::new(total, max_threads.get() + 1),
             token: StdArc::new(()),
         }
     }
@@ -201,15 +209,16 @@ impl Pool {
     #[inline]
     pub fn try_claim(&self) -> Option<PoolPermit<'_>> {
         let token = self.token();
-        let slot = LOCAL
+        let claimed = LOCAL
             .try_with(|local| {
-                local
+                let slot = local
                     .recent_slot(token)
-                    .unwrap_or_else(|| self.bind(local, Binding::slot))
+                    .unwrap_or_else(|| self.bind(local, Binding::slot));
+                self.shared.claim(slot, &local.spill)
             })
             // The thread is exiting and its bindings are gone.
-            .unwrap_or(HOME);
-        self.shared.claim(slot).then(|| PoolPermit { pool: self })
+            .unwrap_or_else(|_| self.shared.claim(RESERVE, &Cell::default()));
+        claimed.then(|| PoolPermit { pool: self })
     }
 
     /// As [`Pool::try_claim`], but the permit is `'static`.
@@ -217,19 +226,23 @@ impl Pool {
         // The permit holds a clone of this thread's handle. On a denied claim
         // it is dropped again, on this thread's own cache line.
         let token = self.token();
-        let (slot, handle) = LOCAL
+        let (claimed, handle) = LOCAL
             .try_with(|local| {
-                local.recent_handle(token).unwrap_or_else(|| {
+                let (slot, handle) = local.recent_handle(token).unwrap_or_else(|| {
                     // Clone needed: the permit holds this thread's handle.
                     self.bind(local, |binding| {
                         (binding.slot(), StdArc::clone(&binding.handle))
                     })
-                })
+                });
+                (self.shared.claim(slot, &local.spill), handle)
             })
             // The thread is exiting: a handle of its own, just this once.
-            .unwrap_or_else(|_| (HOME, StdArc::new(self.handle())));
+            .unwrap_or_else(|_| {
+                let claimed = self.shared.claim(RESERVE, &Cell::default());
+                (claimed, StdArc::new(self.handle()))
+            });
         // Build the permit only on success: dropping one releases a permit.
-        self.shared.claim(slot).then(|| OwnedPermit { handle })
+        claimed.then(|| OwnedPermit { handle })
     }
 
     /// Claims one permit, waiting for one to be released if the pool is
@@ -355,23 +368,32 @@ impl Pool {
 }
 
 /// Returns one permit to the current thread's shard in the pool identified
-/// by `token`, or to [`HOME`] if it has none. Depositing only into this
-/// thread's own participant, or into the home shard, keeps
+/// by `token`, or to the [`RESERVE`] if it has none. Depositing only into this
+/// thread's own participant, or into the reserve, keeps
 /// [`Shared::leave`] sound: a slot's owner is the only one to refill it.
 #[inline]
 fn release(shared: &Shared, token: *const ()) {
-    let slot = LOCAL
-        .try_with(|local| {
-            local.recent_slot(token).or_else(|| {
-                let bindings = local.bindings.try_borrow().ok()?;
+    let released = LOCAL.try_with(|local| {
+        if let Some(slot) = local.recent_slot(token) {
+            // The pool this thread's spill state is for.
+            shared.release(slot, &local.spill);
+            return;
+        }
+        let slot = local
+            .bindings
+            .try_borrow()
+            .ok()
+            .and_then(|bindings| {
                 let binding = bindings.iter().find(|binding| binding.is(token))?;
                 Some(binding.slot())
             })
-        })
-        .ok()
-        .flatten()
-        .unwrap_or(HOME);
-    shared.give(slot, 1);
+            .unwrap_or(RESERVE);
+        shared.give(slot, 1);
+    });
+    if released.is_err() {
+        // The thread is exiting and its bindings are gone.
+        shared.give(RESERVE, 1);
+    }
 }
 
 impl fmt::Debug for Pool {
@@ -423,7 +445,7 @@ impl Binding {
     }
 
     fn slot(&self) -> usize {
-        self.limit.as_ref().map_or(HOME, |limit| limit.slot)
+        self.limit.as_ref().map_or(RESERVE, |limit| limit.slot)
     }
 }
 
@@ -459,15 +481,15 @@ mod tests {
     fn first_claim_registers_the_thread() {
         let pool = Pool::with_capacity(4, cap(2));
         let permit = pool.try_claim().unwrap();
-        // The only participant: drained the home shard, claimed one.
-        assert_eq!((idle(&pool, HOME), idle(&pool, 1)), (0, 3));
+        // The only participant: drained the reserve, claimed one.
+        assert_eq!((idle(&pool, RESERVE), idle(&pool, 1)), (0, 3));
         drop(permit);
         assert_eq!(idle(&pool, 1), 4);
         let second = thread::scope(|s| s.spawn(|| drop(pool.try_claim())).join());
         second.unwrap();
         // A second thread carved half from the first, then exited and handed
         // it back.
-        assert_eq!((idle(&pool, HOME), idle(&pool, 1)), (0, 4));
+        assert_eq!((idle(&pool, RESERVE), idle(&pool, 1)), (0, 4));
     }
 
     #[test]
@@ -491,12 +513,12 @@ mod tests {
     }
 
     #[test]
-    fn permit_released_on_unregistered_thread_goes_home() {
+    fn permit_released_on_unregistered_thread_goes_to_the_reserve() {
         let pool = Pool::with_capacity(2, cap(2));
         let permit = pool.try_claim_owned().unwrap();
-        let home_before = idle(&pool, HOME);
+        let reserve_before = idle(&pool, RESERVE);
         thread::spawn(move || drop(permit)).join().unwrap();
-        assert_eq!(idle(&pool, HOME), home_before + 1);
+        assert_eq!(idle(&pool, RESERVE), reserve_before + 1);
     }
 
     #[test]
@@ -511,12 +533,12 @@ mod tests {
     }
 
     #[test]
-    fn threads_past_capacity_share_the_home_shard() {
+    fn threads_past_capacity_share_the_reserve() {
         let pool = Pool::with_capacity(4, cap(1));
         let _mine = pool.try_claim().unwrap();
         thread::scope(|s| {
             s.spawn(|| {
-                let permit = pool.try_claim().expect("from home");
+                let permit = pool.try_claim().expect("from the reserve");
                 drop(permit);
                 assert!(LOCAL.with(|l| l.bindings.borrow().iter().all(|b| b.limit.is_none())));
             });
@@ -529,15 +551,15 @@ mod tests {
         let pool = Pool::with_capacity(4, cap(2));
         drop(pool.try_claim());
         assert_eq!(idle(&pool, 1), 4);
-        // The last participant leaving hands everything back home.
+        // The last participant leaving hands everything back to the reserve.
         pool.leave_current_thread();
-        assert_eq!((idle(&pool, HOME), idle(&pool, 1)), (4, 0));
+        assert_eq!((idle(&pool, RESERVE), idle(&pool, 1)), (4, 0));
         let _permit = pool.try_claim().unwrap();
-        assert_eq!((idle(&pool, HOME), idle(&pool, 1)), (0, 3));
+        assert_eq!((idle(&pool, RESERVE), idle(&pool, 1)), (0, 3));
     }
 
     #[test]
-    fn thread_on_home_shard_joins_once_a_slot_frees() {
+    fn thread_on_the_reserve_joins_once_a_slot_frees() {
         let pool = Pool::with_capacity(4, cap(1));
         let (joined, left) = (Barrier::new(2), Barrier::new(2));
         let is_participant = || LOCAL.with(|l| l.bindings.borrow()[0].limit.is_some());
@@ -551,7 +573,7 @@ mod tests {
             });
             joined.wait();
             drop(pool.try_claim());
-            assert!(!is_participant(), "at capacity, so on the home shard");
+            assert!(!is_participant(), "at capacity, so on the reserve");
             left.wait();
             left.wait();
             drop(pool.try_claim());
@@ -574,6 +596,20 @@ mod tests {
         let permit = pool.try_claim_owned().unwrap();
         drop(pool);
         drop(permit);
+    }
+
+    #[test]
+    fn churning_thread_releases_into_the_reserve() {
+        let pool = Pool::with_capacity(2, cap(2));
+        let mut held: Vec<_> = (0..2).map_while(|_| pool.try_claim()).collect();
+        let spilling = || LOCAL.with(|local| local.spill.get().spilling);
+        while !spilling() {
+            held.pop();
+            held.push(pool.try_claim().expect("reclaimed locally"));
+            assert!(pool.try_claim().is_none());
+        }
+        held.pop();
+        assert_eq!((idle(&pool, RESERVE), idle(&pool, 1)), (1, 0));
     }
 
     #[test]

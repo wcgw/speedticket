@@ -87,8 +87,43 @@ const MIN_DEFAULT_CAPACITY: NonZeroUsize = NonZeroUsize::new(16).unwrap();
 pub struct Limit {
     shared: Arc<Shared>,
     slot: usize,
+    /// Whether this participant's releases go to its shard or the reserve.
+    spill: Cell<Spill>,
     /// Makes `Limit` `!Sync` while keeping it `Send`.
     _not_sync: PhantomData<Cell<()>>,
+}
+
+/// One thread's spill state on one pool.
+///
+/// A thread whose claims keep finding its own shard empty is churning near
+/// exhaustion: it releases into its shard, reclaims from it, then scans
+/// peers' shards that their owners keep writing, missing in cache on every
+/// one. Such a thread *spills*: it releases into the [`RESERVE`] instead, and
+/// banks what it steals there. Spilling threads leave their shards quiet, so
+/// scans read them from cache, and they meet on the reserve, a single
+/// counter like a plain atomic semaphore's. A spilling thread goes back to
+/// its own shard once the reserve holds a fair share.
+///
+/// A hint only: permits are conserved wherever they are deposited.
+#[derive(Debug, Clone, Copy, Default)]
+struct Spill {
+    /// Rises with claims that had to steal, falls with claims served by
+    /// the thread's own shard; at [`Spill::AT`] the thread spills.
+    score: u32,
+    spilling: bool,
+}
+
+impl Spill {
+    /// Score that turns a thread to spilling. Small under loom, so models
+    /// reach it.
+    const AT: u32 = if cfg!(loom) { 2 } else { 16 };
+    /// Added for a claim that stole a batch.
+    const STOLE: u32 = 2;
+    /// Added for a claim that scanned every shard and found nothing.
+    const MISSED: u32 = 3;
+    /// Taken off for a claim served by the thread's own shard. Against
+    /// `STOLE`, the score rises once more than a third of claims steal.
+    const HIT: u32 = 1;
 }
 
 /// State common to every participant of one pool.
@@ -105,25 +140,20 @@ struct Shared {
     /// The join-lock: guards slot occupancy on the cold registration and
     /// deregistration paths. Claims and releases never take it.
     registry: Mutex<Registry>,
-    first_slot: FirstSlot,
     /// Claims waiting for permits; every deposit notifies it.
     #[cfg(feature = "async")]
     waiters: wait::WaitQueue,
 }
 
-/// The slot that holds the whole budget at creation.
-const FIRST_SLOT: usize = 0;
-
-/// What the [`FIRST_SLOT`] is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FirstSlot {
-    /// The first [`Limit`]: a participant like any other.
-    Participant,
-    /// A [`Pool`]'s home shard, used by threads without a participant of
-    /// their own. It takes no share: newcomers drain it first, and leavers
-    /// refill it only when no participant remains.
-    Home,
-}
+/// The reserve: a shard no participant owns, holding the whole budget at
+/// creation. It takes no share of its own: newcomers drain it first, and
+/// leavers refill it only when no participant remains. Any thread may
+/// deposit into it, which is sound because it never leaves: [`Shared::leave`]
+/// relies on nothing but a slot's owner refilling that slot.
+///
+/// A [`Pool`]'s threads without a participant of their own claim from and
+/// release into it.
+const RESERVE: usize = 0;
 
 /// Which slots are occupied by a live participant.
 struct Registry {
@@ -187,14 +217,20 @@ impl Limit {
     /// assert!(limit.participant().is_err());
     /// ```
     pub fn with_capacity(total: u64, max_participants: NonZeroUsize) -> Self {
-        let shared = Shared::new(total, max_participants.get(), FirstSlot::Participant);
-        Self::from_parts(shared, FIRST_SLOT)
+        let shared = Shared::new(total, max_participants.get() + 1);
+        // The only participant so far: carves the whole budget out of the
+        // reserve.
+        let slot = shared
+            .join()
+            .expect("a new pool has room for at least one participant");
+        Self::from_parts(shared, slot)
     }
 
     fn from_parts(shared: Arc<Shared>, slot: usize) -> Self {
         Self {
             shared,
             slot,
+            spill: Cell::default(),
             _not_sync: PhantomData,
         }
     }
@@ -246,7 +282,9 @@ impl Limit {
     #[inline]
     pub fn try_claim(&self) -> Option<Permit<'_>> {
         // Build the `Permit` only on success: dropping one releases a permit.
-        self.shared.claim(self.slot).then(|| Permit { limit: self })
+        self.shared
+            .claim(self.slot, &self.spill)
+            .then(|| Permit { limit: self })
     }
 
     fn shard(&self) -> &Shard {
@@ -260,6 +298,7 @@ impl fmt::Debug for Limit {
             .field("total", &self.shared.total)
             .field("slot", &self.slot)
             .field("idle", &self.shard().idle())
+            .field("spilling", &self.spill.get().spilling)
             .finish()
     }
 }
@@ -273,33 +312,30 @@ impl Drop for Limit {
 }
 
 impl Shared {
-    /// A pool of `capacity` slots whose [`FIRST_SLOT`] is occupied and holds
-    /// all `total` permits.
-    fn new(total: u64, capacity: usize, first_slot: FirstSlot) -> Arc<Self> {
+    /// A pool of `capacity` slots, the [`RESERVE`] among them, holding all
+    /// `total` permits in the reserve and no participant yet.
+    fn new(total: u64, capacity: usize) -> Arc<Self> {
         let shards = (0..capacity)
-            .map(|slot| Shard::new(if slot == FIRST_SLOT { total } else { 0 }))
+            .map(|slot| Shard::new(if slot == RESERVE { total } else { 0 }))
             .collect();
         let mut occupied = vec![false; capacity].into_boxed_slice();
-        occupied[FIRST_SLOT] = true;
+        // Never handed out to a participant.
+        occupied[RESERVE] = true;
         Arc::new(Self {
             total,
             shards,
-            high_water: AtomicUsize::new(FIRST_SLOT + 1),
+            high_water: AtomicUsize::new(RESERVE + 1),
             vacancies: AtomicUsize::new(capacity - 1),
             registry: Mutex::new(Registry { occupied }),
-            first_slot,
             #[cfg(feature = "async")]
             waiters: wait::WaitQueue::new(),
         })
     }
 
-    /// The occupied slots that take a share of the budget: every live one,
-    /// bar a home shard.
+    /// The slots owned by a live participant: every occupied one bar the
+    /// reserve.
     fn participants<'r>(&self, registry: &'r Registry) -> impl Iterator<Item = usize> + 'r {
-        let home = (self.first_slot == FirstSlot::Home).then_some(FIRST_SLOT);
-        registry
-            .live_slots()
-            .filter(move |&slot| Some(slot) != home)
+        registry.live_slots().filter(|&slot| slot != RESERVE)
     }
 
     /// Whether a slot was free when last looked at, without taking the lock.
@@ -315,11 +351,8 @@ impl Shared {
         let participants = self.participants(&registry).count() + 1;
         let target = self.total / participants as u64;
 
-        let mut need = target;
-        if self.first_slot == FirstSlot::Home {
-            // A home shard keeps no share: drain it before touching peers.
-            need -= self.shards[FIRST_SLOT].take(|_| need);
-        }
+        // The reserve keeps no share: drain it before touching peers.
+        let mut need = target - self.shards[RESERVE].take(|_| target);
         for peer in self.participants(&registry) {
             if need == 0 {
                 break;
@@ -338,7 +371,7 @@ impl Shared {
     }
 
     /// Vacates `slot` and spreads its idle permits evenly over the remaining
-    /// participants, or hands them to a home shard if none remain.
+    /// participants, or hands them to the reserve if none remain.
     fn leave(&self, slot: usize) {
         let mut registry = self.registry();
         registry.occupied[slot] = false;
@@ -348,11 +381,7 @@ impl Shared {
         let idle = self.shards[slot].drain();
         let peers = self.participants(&registry).count() as u64;
         if peers == 0 {
-            if self.first_slot == FirstSlot::Home {
-                self.give(FIRST_SLOT, idle);
-            }
-            // Otherwise this was the last participant: the pool, and its
-            // permits, are gone.
+            self.give(RESERVE, idle);
             return;
         }
         let (share, remainder) = (idle / peers, idle % peers);
@@ -370,19 +399,79 @@ impl Shared {
         self.waiters.notify(n);
     }
 
-    /// Claims one permit for `slot`: from its own shard, else by stealing.
+    /// Claims one permit for `slot`, whose thread's spill state is `spill`:
+    /// from its own shard, else from the reserve and peers.
     #[inline]
-    fn claim(&self, slot: usize) -> bool {
-        self.shards[slot].take(|_| 1) == 1 || self.steal(slot)
+    fn claim(&self, slot: usize, spill: &Cell<Spill>) -> bool {
+        if self.shards[slot].take(|_| 1) == 1 {
+            let state = spill.get();
+            if state.score > 0 {
+                spill.set(Spill {
+                    score: state.score.saturating_sub(Spill::HIT),
+                    ..state
+                });
+            }
+            return true;
+        }
+        self.claim_elsewhere(slot, spill)
+    }
+
+    /// A claim that found `slot`'s own shard empty. A spilling thread tries
+    /// the reserve first, and goes back to its own shard once the reserve
+    /// holds a fair share; any other thread steals, scoring how it went.
+    #[cold]
+    #[inline(never)]
+    fn claim_elsewhere(&self, slot: usize, spill: &Cell<Spill>) -> bool {
+        if slot == RESERVE {
+            // A thread without a shard of its own: always on the reserve.
+            return self.steal(RESERVE, RESERVE);
+        }
+        let state = spill.get();
+        if state.spilling {
+            let reserve = &self.shards[RESERVE];
+            if reserve.idle() >= self.fair_share() {
+                // The pressure is off: take half home, and stop spilling.
+                let taken = reserve.take(|idle| idle / 2);
+                if taken > 0 {
+                    spill.set(Spill::default());
+                    self.give(slot, taken - 1);
+                    return true;
+                }
+            }
+            return reserve.take(|_| 1) == 1 || self.steal(slot, RESERVE);
+        }
+        let stolen = self.steal(slot, slot);
+        let score = state.score + if stolen { Spill::STOLE } else { Spill::MISSED };
+        spill.set(Spill {
+            score,
+            spilling: score >= Spill::AT,
+        });
+        stolen
+    }
+
+    /// Releases one permit claimed for `slot`: into its shard, or into the
+    /// reserve if its thread spills.
+    #[inline]
+    fn release(&self, slot: usize, spill: &Cell<Spill>) {
+        let to = if spill.get().spilling { RESERVE } else { slot };
+        self.give(to, 1);
+    }
+
+    /// An even share of the budget across the participants there have been,
+    /// at most: past this, the reserve has permits to spare.
+    fn fair_share(&self) -> u64 {
+        // `high_water` counts the reserve's slot too; never zero.
+        let participants = self.high_water.load(Relaxed).max(2) - 1;
+        (self.total / participants as u64).max(2)
     }
 
     /// Steals a batch from the peer with the most idle permits, keeping one
-    /// as the claimed permit and banking the rest in `slot`. If a racing claim
-    /// empties that peer first, steals from the first other peer with any.
-    /// Takes from each peer at most once, starting just after `slot`.
+    /// as the claimed permit and banking the rest in `bank`. If a racing
+    /// claim empties that peer first, steals from the first other peer with
+    /// any. Takes from each peer at most once, starting just after `slot`.
     #[cold]
     #[inline(never)]
-    fn steal(&self, slot: usize) -> bool {
+    fn steal(&self, slot: usize, bank: usize) -> bool {
         let scanned = &self.shards[..self.high_water.load(Relaxed)];
         // Peers after this slot, then wrapping round to those before it.
         let peers = scanned.iter().skip(slot + 1).chain(&scanned[..slot]);
@@ -410,7 +499,7 @@ impl Shared {
             });
         match stolen {
             Some(stolen) => {
-                self.give(slot, stolen - 1);
+                self.give(bank, stolen - 1);
                 true
             }
             None => false,
@@ -437,7 +526,9 @@ impl Registry {
 impl Drop for Permit<'_> {
     #[inline]
     fn drop(&mut self) {
-        self.limit.shared.give(self.limit.slot, 1);
+        self.limit
+            .shared
+            .release(self.limit.slot, &self.limit.spill);
     }
 }
 
@@ -609,6 +700,57 @@ mod tests {
         std::mem::forget(a.try_claim().unwrap());
         let b = a.participant().unwrap();
         assert_eq!(pool_idle(&b), 1);
+    }
+
+    fn reserve_idle(limit: &Limit) -> u64 {
+        limit.shared.shards[RESERVE].idle()
+    }
+
+    fn spilling(limit: &Limit) -> bool {
+        limit.spill.get().spilling
+    }
+
+    #[test]
+    fn churning_at_exhaustion_spills_until_the_reserve_fills() {
+        let a = Limit::with_capacity(4, cap(2));
+        let b = a.participant().unwrap(); // 2 each
+        let _b_held: Vec<_> = (0..2).map_while(|_| b.try_claim()).collect();
+        let mut held: Vec<_> = (0..2).map_while(|_| a.try_claim()).collect();
+        // Each round: release one, reclaim it locally, then miss everywhere.
+        let mut rounds = 0;
+        while !spilling(&a) {
+            held.pop();
+            held.push(a.try_claim().expect("reclaimed locally"));
+            assert!(a.try_claim().is_none());
+            rounds += 1;
+            assert!(rounds < 100, "never started spilling");
+        }
+        // Releases now go to the reserve, and claims come back from it.
+        held.pop();
+        assert_eq!((idle(&a), reserve_idle(&a)), (0, 1));
+        held.push(a.try_claim().expect("from the reserve"));
+        assert_eq!(reserve_idle(&a), 0);
+        // Once the reserve holds a fair share (4 / 2), the next claim takes
+        // half of it home and stops spilling.
+        drop(held);
+        assert_eq!(reserve_idle(&a), 2);
+        let _p = a.try_claim().expect("from the reserve");
+        assert!(!spilling(&a));
+        assert_eq!((idle(&a), reserve_idle(&a)), (0, 1));
+    }
+
+    #[test]
+    fn occasional_steals_do_not_spill() {
+        let a = Limit::with_capacity(1000, cap(2));
+        let b = a.participant().unwrap(); // 500 each
+        // Until b has nothing left to steal (each steal takes half of it).
+        while idle(&b) > 0 {
+            // Exhaust a's shard, steal once, then give everything back home.
+            let held: Vec<_> = (0..idle(&a)).map_while(|_| a.try_claim()).collect();
+            let stolen = a.try_claim().expect("steal from b");
+            drop((held, stolen));
+            assert!(!spilling(&a));
+        }
     }
 
     #[test]
