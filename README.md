@@ -13,11 +13,16 @@ participants one by one: the first holds 12, two participants hold 6 each, three
 hold 4 each, and so on. No sharing is required across threads on the happy path.
 
 When a participant exhausts its own share, it tries to **steal** idle permits
-from another participant. That is the only point where contention can occur.
-Stealing is lock-free and bounded, so it can neither deadlock nor spin; a claim
-that finds nothing to steal fails fast rather than blocking. The limit is a hard
-upper bound (it never over-admits) and a best-effort lower bound (it may rarely
-deny while a permit is momentarily in flight).
+from another participant. Stealing is lock-free and bounded, so it can neither
+deadlock nor spin; a claim that finds nothing to steal fails fast rather than
+blocking. A participant that keeps running dry, churning near exhaustion,
+**spills**: it releases into a shared reserve and claims from there before
+stealing, so such threads meet on a single counter instead of scanning each
+other's shards. It goes back to its own shard once the reserve holds a fair
+share again. On the claim path, stealing and the reserve are the only points
+where contention can occur. The limit is a hard upper bound (it never
+over-admits) and a best-effort lower bound (it may rarely deny while a permit is
+momentarily in flight).
 
 See [DESIGN.md](DESIGN.md) for the full design.
 
@@ -125,8 +130,8 @@ taskset -c 6-11 cargo bench -- '/[1246]_threads/'
 taskset -c 2-9 cargo bench -- '/8_threads/'
 ```
 
-Across three runs, 51 of the 60 results varied by under 10%, but some varied by
-up to 13% (`speedticket`), 19% (single atomic) and 25% (tokio). Treat them as
+Across three runs, 40 of the 60 results varied by under 10%, but some varied by
+up to 17% (`speedticket`), 27% (single atomic) and 47% (tokio). Treat them as
 indicative only.
 
 ### `claim_release`: the common case
@@ -139,17 +144,17 @@ holding one across an `.await` would (`Pool::try_claim_owned`,
 
 | threads | `Limit` | `Pool`  | `Pool` owned | tokio   | tokio owned | single atomic |
 |--------:|--------:|--------:|-------------:|--------:|------------:|--------------:|
-| 1       | 4.55 ns | 4.62 ns | 8.73 ns      | 8.84 ns | 13.3 ns     | 4.54 ns       |
-| 2       | 4.56 ns | 4.62 ns | 9.78 ns      | 117 ns  | 154 ns      | 36.2 ns       |
-| 4       | 4.55 ns | 4.63 ns | 9.45 ns      | 379 ns  | 451 ns      | 78.8 ns       |
-| 8       | 5.24 ns | 5.34 ns | 9.76 ns      | 738 ns  | 946 ns      | 339 ns        |
+| 1       | 4.47 ns | 4.55 ns | 8.74 ns      | 8.84 ns | 13.2 ns     | 4.55 ns       |
+| 2       | 4.49 ns | 4.55 ns | 8.77 ns      | 119 ns  | 151 ns      | 37.3 ns       |
+| 4       | 4.48 ns | 4.57 ns | 9.82 ns      | 352 ns  | 425 ns      | 79.9 ns       |
+| 8       | 4.86 ns | 4.93 ns | 9.76 ns      | 837 ns  | 1.05 µs     | 332 ns        |
 
 Both `speedticket` variants stay flat as threads are added, because each thread
 claims and releases against its own shard. Every other variant contends on one
 shared counter, and `tokio::sync::Semaphore` also takes a lock on every
 release, so they slow down as soon as a second thread joins: at 8 threads,
-spread over both CCDs, `Pool` is about 140× faster than tokio, and its owned
-permits about 95× faster than tokio's.
+spread over both CCDs, `Pool` is about 140–170× faster than tokio, and its owned
+permits about 90–110× faster than tokio's.
 
 ### `fill_drain`: race to exhaustion, then release everything
 
@@ -160,9 +165,9 @@ pays.
 
 | threads | `Limit` | `Pool`  | tokio   | single atomic |
 |--------:|--------:|--------:|--------:|--------------:|
-| 4       | 8.53 µs | 8.22 µs | 31.5 µs | 13.9 µs       |
-| 6       | 12.8 µs | 12.7 µs | 33.9 µs | 19.6 µs       |
-| 8       | 32.5 µs | 32.9 µs | 90.7 µs | 49.9 µs       |
+| 4       | 9.07 µs | 8.39 µs | 27.6 µs | 14.1 µs       |
+| 6       | 13.0 µs | 12.6 µs | 34.8 µs | 20.1 µs       |
+| 8       | 26.4 µs | 26.7 µs | 102 µs  | 50.9 µs       |
 
 ### `steal`: pinned at exhaustion
 
@@ -172,20 +177,21 @@ no barriers between threads. This forces claims onto the steal path, where
 
 | threads | churn | `Limit` | `Pool`  | tokio   | single atomic |
 |--------:|------:|--------:|--------:|--------:|--------------:|
-| 4       | 1     | 356 ns  | 343 ns  | 403 ns  | 62.0 ns       |
-| 4       | 4     | 1.02 µs | 866 ns  | 1.20 µs | 432 ns        |
-| 6       | 1     | 714 ns  | 675 ns  | 591 ns  | 88.4 ns       |
-| 6       | 4     | 1.86 µs | 1.67 µs | 1.94 µs | 584 ns        |
-| 8       | 1     | 1.38 µs | 1.21 µs | 847 ns  | 238 ns        |
-| 8       | 4     | 4.03 µs | 3.53 µs | 2.81 µs | 1.30 µs       |
+| 4       | 1     | 92.0 ns | 78.8 ns | 403 ns  | 69.3 ns       |
+| 4       | 4     | 483 ns  | 482 ns  | 1.04 µs | 386 ns        |
+| 6       | 1     | 110 ns  | 128 ns  | 613 ns  | 92.0 ns       |
+| 6       | 4     | 727 ns  | 714 ns  | 1.74 µs | 579 ns        |
+| 8       | 1     | 349 ns  | 383 ns  | 977 ns  | 236 ns        |
+| 8       | 4     | 1.89 µs | 1.79 µs | 3.91 µs | 1.28 µs       |
 
-With a churn of 1, most claims end with a search of every peer that finds
-nothing, and every search reads cache lines that other cores keep changing.
-This is `speedticket`'s worst case: the single atomic needs just one read to
-say no, and is about 5–8× faster. Once peers have permits to give (churn 4),
-the gap narrows to about 2–3.2×, but the single atomic still wins at every
-thread count. tokio trails both `speedticket` variants at 4 threads, and at 6
-threads with churn 4; everywhere else it beats them, by up to about 1.6×.
+Every round ends with a claim that searches every peer and finds nothing.
+Threads churning like this spill: they release into the shared reserve and
+claim from it before stealing, so their own shards stay quiet, and the
+searches read cache lines that rarely change. The spilling threads meet on the
+reserve, a single counter like the single atomic's. This is still
+`speedticket`'s worst case: the single atomic is about 1.1–1.6× faster at a
+churn of 1, and about 1.2–1.5× at a churn of 4. tokio is slower than both
+`speedticket` variants everywhere, by about 2–5.6×.
 
 ## License
 

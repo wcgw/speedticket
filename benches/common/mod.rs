@@ -95,7 +95,7 @@ impl Participant for Arc<AtomicLimit> {
 
     fn try_claim(&self) -> Option<Self::Permit<'_>> {
         self.idle
-            .fetch_update(Relaxed, Relaxed, |idle| idle.checked_sub(1))
+            .try_update(Relaxed, Relaxed, |idle| idle.checked_sub(1))
             .ok()
             .map(|_| AtomicPermit { idle: &self.idle })
     }

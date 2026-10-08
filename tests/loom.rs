@@ -95,6 +95,56 @@ fn never_over_admits_and_conserves_permits() {
     });
 }
 
+/// A participant starts spilling (with loom's low threshold, its first steal
+/// or miss does it), releases into the reserve, then stops spilling as the
+/// reserve fills, while a peer claims, steals and releases alongside. No
+/// interleaving over-admits, loses or creates a permit.
+#[test]
+fn spilling_and_unspilling_conserve_permits() {
+    const TOTAL: u64 = 2;
+
+    model(|| {
+        let first = Limit::new(TOTAL);
+        let second = first.participant().unwrap(); // 1 each
+        let in_use = Arc::new(AtomicU64::new(0));
+        let count = |in_use: &AtomicU64| {
+            let now = in_use.fetch_add(1, SeqCst) + 1;
+            assert!(now <= TOTAL, "{now} permits held, total is {TOTAL}");
+        };
+
+        let spiller = {
+            let in_use = Arc::clone(&in_use);
+            thread::spawn(move || {
+                let mut held = Vec::new();
+                for _ in 0..2 {
+                    if let Some(permit) = second.try_claim() {
+                        count(&in_use);
+                        held.push(permit);
+                    }
+                }
+                for permit in held {
+                    in_use.fetch_sub(1, SeqCst);
+                    drop(permit);
+                }
+                // With the reserve full, this one takes half of it home.
+                if let Some(permit) = second.try_claim() {
+                    count(&in_use);
+                    in_use.fetch_sub(1, SeqCst);
+                    drop(permit);
+                }
+            })
+        };
+        if let Some(permit) = first.try_claim() {
+            count(&in_use);
+            in_use.fetch_sub(1, SeqCst);
+            drop(permit);
+        }
+        spiller.join().unwrap();
+
+        assert_eq!(claim_all(&first), TOTAL, "permits were lost or created");
+    });
+}
+
 /// Racing participants that never release must, between them, claim exactly
 /// the whole budget: a spurious denial may stop one of them early, but never
 /// strands permits where no one can reach them.
@@ -202,14 +252,14 @@ fn pool_cross_thread_release_while_threads_leave() {
     });
 }
 
-/// A permit dropped on a thread that never claimed goes to the pool's home
-/// shard, racing with a newcomer that has nothing to carve and so steals
-/// from that same shard, then leaves.
+/// A permit dropped on a thread that never claimed goes to the pool's
+/// reserve, racing with a newcomer that has nothing to carve and so steals
+/// from the reserve, then leaves.
 #[test]
-fn pool_release_on_unbound_thread_races_home_steal() {
+fn pool_release_on_unbound_thread_races_reserve_steal() {
     model(|| {
         let pool = pool();
-        // Main registers (carving 1 of 2) and claims it; home keeps 1.
+        // Main registers (carving 1 of 2) and claims it; the reserve keeps 1.
         let migrating = pool.try_claim_owned().expect("main's own share");
 
         let stealer = {
@@ -257,12 +307,12 @@ fn pool_exiting_threads_never_over_admit() {
     });
 }
 
-/// A thread stuck on the home shard (the pool is at capacity) joins as soon
+/// A thread stuck on the reserve (the pool is at capacity) joins as soon
 /// as the participant holding the only slot leaves, racing that departure's
-/// hand-back of its share to the home shard, and a permit released after its
+/// hand-back of its share to the reserve, and a permit released after its
 /// claimer left. No interleaving over-admits, loses or creates a permit.
 #[test]
-fn pool_home_thread_joins_freed_slot() {
+fn pool_reserve_thread_joins_freed_slot() {
     model(|| {
         let pool = std::sync::Arc::new(Pool::with_capacity(TOTAL, NonZeroUsize::new(1).unwrap()));
         let in_use = Arc::new(AtomicU64::new(0));
@@ -272,7 +322,7 @@ fn pool_home_thread_joins_freed_slot() {
         let waiting = {
             let (pool, in_use) = (pool.clone(), Arc::clone(&in_use));
             thread::spawn(move || {
-                // On the home shard at first; may join once main has left.
+                // On the reserve at first; may join once main has left.
                 for _ in 0..2 {
                     if let Some(permit) = counted_claim(&pool, &in_use) {
                         counted_release(permit, &in_use);
@@ -282,7 +332,7 @@ fn pool_home_thread_joins_freed_slot() {
             })
         };
         pool.leave_current_thread();
-        // Main has no participant now, so this goes to the home shard.
+        // Main has no participant now, so this goes to the reserve.
         counted_release(held, &in_use);
         waiting.join().unwrap();
 
@@ -349,8 +399,8 @@ mod waiting {
             drop(pool.try_claim());
             let thief = {
                 let pool = pool.clone();
-                // At capacity, so on the home shard: steals half of main's
-                // idle permits, banks all but one at home, keeps that one.
+                // At capacity, so on the reserve: steals half of main's
+                // idle permits, banks all but one in the reserve, keeps that one.
                 thread::spawn(move || pool.try_claim().map(mem::forget))
             };
             let waiter = {
