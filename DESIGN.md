@@ -65,10 +65,11 @@ and released, nothing more.
   share), so it is an explicit fallible method rather than `Clone`.
 - `Drop` — deregisters the participant (frees its slot) and redistributes its
   remaining **idle** permits to peers. When the last participant drops, its idle
-  permits go to the reserve; for a `Limit`, the pool is then gone with them. Permits that were **claimed but never released**
-  at drop time are an accepted, documented leak (effective budget shrinks) — the
-  single-counter representation does not track per-handle claimed counts. A
-  `debug_assert` may warn on obvious misuse.
+  permits go to the reserve; for a `Limit`, the pool is then gone with them.
+  Permits that were **claimed but never released** at drop time are an accepted,
+  documented leak (effective budget shrinks) — the single-counter representation
+  does not track per-handle claimed counts. A `debug_assert` may warn on obvious
+  misuse.
 
 ## Claiming — non-blocking only
 
@@ -80,7 +81,9 @@ and released, nothing more.
   peer with the most idle permits (the first in rotation order on a tie). If a
   racing claim empties it first, steal from the first other peer that has any. If
   the whole pass gathers nothing, return `None` (fail-fast). The pass takes from
-  each peer at most once, so a claim can never spin.
+  each peer at most once, so a claim can never spin. From the reserve, which is
+  everyone's, a steal takes only a *reserve share*: `max(1, reserve_idle /
+  participants)`, counting participants as for the fair share below.
 - **Spilling:** a participant whose claims keep finding its own shard empty is
   churning near exhaustion: it releases into its shard, reclaims from it, then
   scans peers' shards that their owners keep writing, missing in cache on each.
@@ -92,9 +95,11 @@ and released, nothing more.
   participants leave their shards quiet, so scans read them from cache, and they
   meet on the reserve, a single counter like a plain atomic semaphore's. Once the
   reserve holds a fair share (`total` divided by the participant slots up to the
-  highest one ever occupied, and at least 2), the next such claim takes half the reserve home, and the
-  participant stops spilling and resets its score. Spilling only changes where
-  permits are deposited and looked for first, never how many exist.
+  highest one ever occupied, and at least 2), the next such claim takes a reserve
+  share home, and the participant stops spilling and resets its score. Taking a
+  share rather than half drains the reserve evenly across everyone coming back to
+  it. Spilling only changes where permits are deposited and looked for first,
+  never how many exist.
 - **Hard upper bound:** the number of simultaneously-claimed permits never exceeds
   `total`, under any race.
 - **Best-effort lower bound:** a `claim` may *occasionally* return `None` even

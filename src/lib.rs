@@ -264,8 +264,8 @@ impl Limit {
     ///
     /// Takes from this participant's own shard when it can. Otherwise it
     /// makes one bounded pass over its peers, stealing half the idle permits
-    /// of the one with the most; if that pass finds nothing it returns `None`
-    /// rather than wait.
+    /// of the one with the most (less if that is the pool's shared reserve);
+    /// if that pass finds nothing it returns `None` rather than wait.
     ///
     /// The number of simultaneously claimed permits never exceeds the pool's
     /// total. A claim may, rarely, return `None` while a permit is in flight
@@ -430,8 +430,8 @@ impl Shared {
         if state.spilling {
             let reserve = &self.shards[RESERVE];
             if reserve.idle() >= self.fair_share() {
-                // The pressure is off: take half home, and stop spilling.
-                let taken = reserve.take(|idle| idle / 2);
+                // The pressure is off: take a share home, and stop spilling.
+                let taken = reserve.take(|idle| self.reserve_share(idle));
                 if taken > 0 {
                     spill.set(Spill::default());
                     self.give(slot, taken - 1);
@@ -457,18 +457,42 @@ impl Shared {
         self.give(to, 1);
     }
 
+    /// The participants there have been, at most: every slot up to the
+    /// highest one ever occupied, bar the reserve's. Never zero.
+    fn participants_seen(&self) -> u64 {
+        // `high_water` counts the reserve's slot too.
+        (self.high_water.load(Relaxed).max(2) - 1) as u64
+    }
+
     /// An even share of the budget across the participants there have been,
     /// at most: past this, the reserve has permits to spare.
     fn fair_share(&self) -> u64 {
-        // `high_water` counts the reserve's slot too; never zero.
-        let participants = self.high_water.load(Relaxed).max(2) - 1;
-        (self.total / participants as u64).max(2)
+        (self.total / self.participants_seen()).max(2)
     }
 
-    /// Steals a batch from the peer with the most idle permits, keeping one
-    /// as the claimed permit and banking the rest in `bank`. If a racing
-    /// claim empties that peer first, steals from the first other peer with
-    /// any. Takes from each peer at most once, starting just after `slot`.
+    /// What one claim takes of the reserve's `idle` permits: a share per
+    /// participant rather than half, so the reserve drains evenly across
+    /// everyone coming back to it. At least one, so a claim never passes
+    /// over a reserve that has any.
+    fn reserve_share(&self, idle: u64) -> u64 {
+        (idle / self.participants_seen()).max(1)
+    }
+
+    /// How many of `peer`'s `idle` permits a steal takes: half, or from the
+    /// reserve, which is everyone's, only a [`Shared::reserve_share`].
+    fn batch(&self, peer: &Shard, idle: u64) -> u64 {
+        if ptr::eq(peer, &self.shards[RESERVE]) {
+            self.reserve_share(idle)
+        } else {
+            (idle / 2).max(1)
+        }
+    }
+
+    /// Steals a [`Shared::batch`] from the peer with the most idle permits,
+    /// keeping one as the claimed permit and banking the rest in `bank`. If
+    /// a racing claim empties that peer first, steals from the first other
+    /// peer with any. Takes from each peer at most once, starting just after
+    /// `slot`.
     #[cold]
     #[inline(never)]
     fn steal(&self, slot: usize, bank: usize) -> bool {
@@ -488,13 +512,12 @@ impl Shared {
         let Some(richest) = richest else {
             return false;
         };
-        let half = |idle: u64| (idle / 2).max(1);
-        let stolen = Some(richest.take(half))
+        let stolen = Some(richest.take(|idle| self.batch(richest, idle)))
             .filter(|&stolen| stolen > 0)
             .or_else(|| {
                 peers
                     .filter(|&peer| !ptr::eq(peer, richest))
-                    .map(|peer| peer.take(half))
+                    .map(|peer| peer.take(|idle| self.batch(peer, idle)))
                     .find(|&stolen| stolen > 0)
             });
         match stolen {
