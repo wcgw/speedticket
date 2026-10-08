@@ -1,6 +1,6 @@
 [package]
 name = "speedticket"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "A sharded, finite-budget semaphore: per-thread shards with lock-free, bounded stealing"
 license = "Apache-2.0"
