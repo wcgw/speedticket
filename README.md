@@ -24,7 +24,9 @@ where contention can occur. The limit is a hard upper bound (it never
 over-admits) and a best-effort lower bound (it may rarely deny while a permit is
 momentarily in flight).
 
-See [DESIGN.md](DESIGN.md) for the full design.
+See [DESIGN.md](DESIGN.md) for the full design, and
+[swim-caps.md](swim-caps.md) for how it got there, told as a swimming pool
+handing out swim caps.
 
 ## Usage
 
